@@ -1,0 +1,842 @@
+package com.photoalbum.service.impl;
+
+import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
+import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
+import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
+import com.photoalbum.common.BusinessException;
+import com.photoalbum.dto.PhotoDTO;
+import com.photoalbum.entity.Category;
+import com.photoalbum.entity.Photo;
+import com.photoalbum.entity.PhotoCollectionPhoto;
+import com.photoalbum.entity.ShareLink;
+import com.photoalbum.entity.User;
+import com.photoalbum.entity.UserPermission;
+import com.photoalbum.mapper.CategoryMapper;
+import com.photoalbum.mapper.PhotoCollectionPhotoMapper;
+import com.photoalbum.mapper.PhotoMapper;
+import com.photoalbum.mapper.ShareLinkMapper;
+import com.photoalbum.mapper.UserPermissionMapper;
+import com.photoalbum.service.PhotoService;
+import com.qcloud.cos.COSClient;
+import com.qcloud.cos.model.ObjectMetadata;
+import com.qcloud.cos.model.PutObjectRequest;
+import org.springframework.security.core.Authentication;
+import org.springframework.security.core.context.SecurityContextHolder;
+import com.drew.imaging.ImageMetadataReader;
+import com.drew.metadata.Directory;
+import com.drew.metadata.Metadata;
+import com.drew.metadata.exif.ExifIFD0Directory;
+import com.drew.metadata.exif.ExifSubIFDDirectory;
+import com.drew.metadata.exif.GpsDirectory;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+import org.springframework.web.multipart.MultipartFile;
+
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
+import java.io.File;
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.StandardCopyOption;
+import java.awt.image.BufferedImage;
+import java.awt.Graphics2D;
+import java.awt.RenderingHints;
+import javax.imageio.ImageIO;
+import java.util.LinkedHashSet;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
+import java.util.*;
+import java.util.stream.Collectors;
+
+/**
+ * 照片服务实现
+ */
+@Slf4j
+@Service
+@RequiredArgsConstructor
+public class PhotoServiceImpl extends ServiceImpl<PhotoMapper, Photo> implements PhotoService {
+
+    private final PhotoMapper photoMapper;
+    private final CategoryMapper categoryMapper;
+    private final PhotoCollectionPhotoMapper collectionPhotoMapper;
+    private final ShareLinkMapper shareLinkMapper;
+    private final UserPermissionMapper permMapper;
+    private final COSClient cosClient;
+    private final ObjectMapper objectMapper = new ObjectMapper();
+
+    @Value("${cos.bucket}")
+    private String cosBucket;
+
+    @Value("${cos.domain}")
+    private String cosDomain;
+
+    @Value("${file.access-url-prefix}")
+    private String accessUrlPrefix;
+
+    /** 当前用户是否为管理员（role == admin） */
+    private boolean isAdmin() {
+        User user = getCurrentUser();
+        return user != null && "admin".equals(user.getRole());
+    }
+
+    private boolean canViewPrivate() {
+        User user = getCurrentUser();
+        return user != null && ("admin".equals(user.getRole()) || "viewer".equals(user.getRole()));
+    }
+
+    private void applyViewerPermission(LambdaQueryWrapper<Photo> wrapper) {
+        if (!canViewPrivate()) { wrapper.eq(Photo::getIsPrivate, 0); return; }
+        if (isAdmin()) return;
+        User user = getCurrentUser();
+        if (user == null) return;
+
+        // 1. 加载该用户的全部权限条目
+        List<UserPermission> allPerms = permMapper.selectList(
+            new LambdaQueryWrapper<UserPermission>().eq(UserPermission::getUserId, user.getId()));
+        if (allPerms.isEmpty()) return;
+
+        // 2. 拆分照片级和合集级权限
+        List<Long> photoWhitelist = new ArrayList<>();
+        List<Long> photoBlacklist = new ArrayList<>();
+        List<Long> collectionWhitelist = new ArrayList<>();
+        List<Long> collectionBlacklist = new ArrayList<>();
+        for (UserPermission p : allPerms) {
+            boolean isWhite = "W".equals(p.getPermType());
+            if ("photo".equals(p.getTargetType())) {
+                if (isWhite) photoWhitelist.add(p.getTargetId()); else photoBlacklist.add(p.getTargetId());
+            } else if ("collection".equals(p.getTargetType())) {
+                if (isWhite) collectionWhitelist.add(p.getTargetId()); else collectionBlacklist.add(p.getTargetId());
+            }
+        }
+
+        // 3. 合集权限级联到内部照片
+        if (!collectionWhitelist.isEmpty()) {
+            List<Long> cascadeIds = getPhotoIdsInCollections(collectionWhitelist);
+            photoWhitelist.addAll(cascadeIds);
+        }
+        if (!collectionBlacklist.isEmpty()) {
+            List<Long> cascadeIds = getPhotoIdsInCollections(collectionBlacklist);
+            photoBlacklist.addAll(cascadeIds);
+        }
+
+        // 4. 应用过滤
+        if (!photoWhitelist.isEmpty()) {
+            wrapper.and(w -> w.eq(Photo::getIsPrivate, 0).or().in(Photo::getId, photoWhitelist));
+        } else if (!photoBlacklist.isEmpty()) {
+            wrapper.and(w -> w.eq(Photo::getIsPrivate, 0)
+                .or(w2 -> w2.eq(Photo::getIsPrivate, 1).notIn(Photo::getId, photoBlacklist)));
+        }
+    }
+
+    /** 获取指定合集下的所有照片 ID */
+    private List<Long> getPhotoIdsInCollections(List<Long> collectionIds) {
+        if (collectionIds.isEmpty()) return List.of();
+        return collectionPhotoMapper.selectList(
+                new LambdaQueryWrapper<PhotoCollectionPhoto>()
+                    .in(PhotoCollectionPhoto::getCollectionId, collectionIds))
+            .stream().map(PhotoCollectionPhoto::getPhotoId).distinct().collect(Collectors.toList());
+    }
+
+    private User getCurrentUser() {
+        Authentication auth = SecurityContextHolder.getContext().getAuthentication();
+        if (auth == null || !auth.isAuthenticated()) return null;
+        Object principal = auth.getPrincipal();
+        if (principal instanceof User) return (User) principal;
+        return null;
+    }
+
+    /**
+     * 分页查询
+     */
+    @Override
+    public Object getPhotoPage(PhotoDTO dto) {
+        Page<Photo> page = new Page<>(dto.getPageNum(), dto.getPageSize());
+
+        LambdaQueryWrapper<Photo> wrapper = new LambdaQueryWrapper<>();
+
+        // 关键词搜索（标题或描述）
+        if (dto.getKeyword() != null && !dto.getKeyword().isBlank()) {
+            wrapper.and(w -> w
+                    .like(Photo::getTitle, dto.getKeyword())
+                    .or()
+                    .like(Photo::getDescription, dto.getKeyword())
+            );
+        }
+
+        // 分类筛选
+        if (dto.getCategoryIdFilter() != null) {
+            wrapper.eq(Photo::getCategoryId, dto.getCategoryIdFilter());
+        }
+
+        // 非管理员看不到私密照片
+        applyViewerPermission(wrapper);
+
+        wrapper.orderByDesc(Photo::getCreatedAt);
+
+        Page<Photo> result = photoMapper.selectPage(page, wrapper);
+
+        // 转换为 DTO，填充分类名称
+        List<PhotoDTO> dtoList = result.getRecords().stream().map(this::toDTO).collect(Collectors.toList());
+
+        Map<String, Object> data = new HashMap<>();
+        data.put("list", dtoList);
+        data.put("total", result.getTotal());
+        data.put("pageNum", result.getCurrent());
+        data.put("pageSize", result.getSize());
+        return data;
+    }
+
+    /**
+     * 上传图片到腾讯云 COS
+     */
+    @Override
+    public PhotoDTO upload(MultipartFile file, String title, Long categoryId, Long collectionId,
+                           String description, String tags, Integer isPrivate) throws Exception {
+        validateFile(file);
+
+        String dateDir = LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyy/MM"));
+        String originalName = file.getOriginalFilename();
+        String ext = getFileExtension(originalName);
+        String uuidName = UUID.randomUUID().toString().replace("-", "") + ext;
+
+        byte[] fileBytes = file.getBytes();
+
+        // 上传原图到 COS
+        String cosKey = dateDir + "/" + uuidName;
+        uploadToCos(fileBytes, cosKey, file.getContentType());
+
+        // 生成缩略图并上传（800px 宽，高画质）
+        String thumbKey = dateDir + "/thumb_" + uuidName.replaceFirst("\\.[^.]+$", ".jpg");
+        byte[] thumbBytes = generateThumbnailBytes(fileBytes, 800);
+        if (thumbBytes != null) {
+            uploadToCos(thumbBytes, thumbKey, "image/jpeg");
+        }
+
+        // EXIF 解析（用临时文件）
+        File tmpFile = File.createTempFile("upload_", ext);
+        file.transferTo(tmpFile);
+        Map<String, String> exifData = parseExif(tmpFile);
+        tmpFile.delete();
+
+        Photo photo = new Photo();
+        photo.setTitle(title != null ? title : originalName);
+        photo.setDescription(description != null ? description : "");
+        photo.setCategoryId(categoryId);
+        photo.setUrl(cosDomain + "/" + cosKey);
+        photo.setThumbnailUrl(thumbBytes != null ? cosDomain + "/" + thumbKey : null);
+        photo.setFileName(originalName);
+        photo.setFileSize(file.getSize());
+        photo.setTags(tags != null ? tags : "");
+        photo.setIsPrivate(isPrivate != null ? isPrivate : 0);
+        photo.setViewCount(0);
+        photo.setLikeCount(0);
+        photo.setExifInfo(exifData.get("exifJson"));
+        String rawModel = exifData.getOrDefault("cameraModel", "");
+        photo.setCameraModel(rawModel.trim().replaceAll("\\s+", " "));
+        photo.setAperture(exifData.getOrDefault("aperture", ""));
+        photo.setShutterSpeed(exifData.getOrDefault("shutterSpeed", ""));
+        photo.setIso(exifData.getOrDefault("iso", ""));
+        photo.setFocalLength(exifData.getOrDefault("focalLength", ""));
+        photo.setDateTaken(exifData.getOrDefault("dateTaken", ""));
+        photo.setGpsLatitude(parseDecimal(exifData.get("gpsLatitude")));
+        photo.setGpsLongitude(parseDecimal(exifData.get("gpsLongitude")));
+        photo.setCreatedAt(LocalDateTime.now());
+        photo.setUpdatedAt(LocalDateTime.now());
+
+        photoMapper.insert(photo);
+
+        // 若指定了合集，自动加入
+        if (collectionId != null) {
+            PhotoCollectionPhoto rel = new PhotoCollectionPhoto();
+            rel.setCollectionId(collectionId);
+            rel.setPhotoId(photo.getId());
+            collectionPhotoMapper.insert(rel);
+        }
+
+        log.info("图片上传成功到COS: {} -> {}", originalName, cosKey);
+        return toDTO(photo);
+    }
+
+    private void uploadToCos(byte[] data, String key, String contentType) {
+        ObjectMetadata meta = new ObjectMetadata();
+        meta.setContentLength(data.length);
+        meta.setContentType(contentType);
+        cosClient.putObject(new PutObjectRequest(cosBucket, key,
+                new ByteArrayInputStream(data), meta));
+    }
+
+    private byte[] generateThumbnailBytes(byte[] imageBytes, int maxWidth) {
+        try {
+            BufferedImage original = ImageIO.read(new ByteArrayInputStream(imageBytes));
+            if (original == null) return null;
+            int w = original.getWidth();
+            int h = original.getHeight();
+            if (w <= maxWidth) return imageBytes;
+
+            int newW = maxWidth;
+            int newH = (int) (h * ((double) maxWidth / w));
+            BufferedImage thumb = new BufferedImage(newW, newH, BufferedImage.TYPE_INT_RGB);
+            Graphics2D g2d = thumb.createGraphics();
+            g2d.setRenderingHint(RenderingHints.KEY_INTERPOLATION, RenderingHints.VALUE_INTERPOLATION_BICUBIC);
+            g2d.setRenderingHint(RenderingHints.KEY_RENDERING, RenderingHints.VALUE_RENDER_QUALITY);
+            g2d.drawImage(original, 0, 0, newW, newH, null);
+            g2d.dispose();
+
+            // 高质量 JPEG 输出
+            ByteArrayOutputStream out = new ByteArrayOutputStream();
+            javax.imageio.ImageWriter writer = ImageIO.getImageWritersByFormatName("jpeg").next();
+            javax.imageio.plugins.jpeg.JPEGImageWriteParam jpegParams = 
+                (javax.imageio.plugins.jpeg.JPEGImageWriteParam) writer.getDefaultWriteParam();
+            jpegParams.setCompressionMode(javax.imageio.plugins.jpeg.JPEGImageWriteParam.MODE_EXPLICIT);
+            jpegParams.setCompressionQuality(0.85f);
+            writer.setOutput(ImageIO.createImageOutputStream(out));
+            writer.write(null, new javax.imageio.IIOImage(thumb, null, null), jpegParams);
+            writer.dispose();
+            return out.toByteArray();
+        } catch (Exception e) {
+            log.warn("缩略图生成失败: {}", e.getMessage());
+            return null;
+        }
+    }
+
+    /**
+     * 修改照片信息
+     */
+    @Override
+    public void updatePhoto(Long id, PhotoDTO dto) {
+        Photo photo = photoMapper.selectById(id);
+        if (photo == null) {
+            throw new BusinessException(404, "照片不存在");
+        }
+
+        if (dto.getTitle() != null) photo.setTitle(dto.getTitle());
+        if (dto.getDescription() != null) photo.setDescription(dto.getDescription());
+        if (dto.getCategoryId() != null) photo.setCategoryId(dto.getCategoryId());
+        if (dto.getTags() != null) photo.setTags(dto.getTags());
+        if (dto.getIsPrivate() != null && isAdmin()) photo.setIsPrivate(dto.getIsPrivate());
+        photo.setUpdatedAt(LocalDateTime.now());
+
+        photoMapper.updateById(photo);
+    }
+
+    /**
+     * 删除单张照片（同步删除磁盘文件）
+     */
+    @Override
+    @Transactional(rollbackFor = Exception.class)
+    public void deletePhoto(Long id) throws Exception {
+        Photo photo = photoMapper.selectById(id);
+        if (photo == null) {
+            throw new BusinessException(404, "照片不存在");
+        }
+
+        // 删除 COS 文件（原图 + 缩略图）
+        deleteFile(photo.getUrl());
+        deleteFile(photo.getThumbnailUrl());
+
+        // 删除合集关联
+        LambdaQueryWrapper<PhotoCollectionPhoto> colWp = new LambdaQueryWrapper<>();
+        colWp.eq(PhotoCollectionPhoto::getPhotoId, id);
+        collectionPhotoMapper.delete(colWp);
+
+        // 删除分享链接
+        LambdaQueryWrapper<ShareLink> shareWp = new LambdaQueryWrapper<>();
+        shareWp.eq(ShareLink::getPhotoId, id);
+        shareLinkMapper.delete(shareWp);
+
+        // 删除数据库记录
+        photoMapper.deleteById(id);
+
+        log.info("照片已删除: id={}", id);
+    }
+
+    /**
+     * 仪表盘统计数据
+     */
+    @Override
+    public Map<String, Object> getDashboardStats() {
+        Map<String, Object> data = new HashMap<>();
+
+        // 照片总数
+        long totalPhotos = photoMapper.selectCount(null);
+        data.put("totalPhotos", totalPhotos);
+
+        // 分类数量
+        long totalCategories = categoryMapper.selectCount(null);
+        data.put("totalCategories", totalCategories);
+
+        // 总浏览量
+        List<Photo> allPhotos = photoMapper.selectList(null);
+        int totalViews = allPhotos.stream()
+                .mapToInt(p -> p.getViewCount() != null ? p.getViewCount() : 0)
+                .sum();
+        data.put("totalViews", totalViews);
+
+        // 存储用量
+        long totalBytes = allPhotos.stream()
+                .mapToLong(p -> p.getFileSize() != null ? p.getFileSize() : 0L)
+                .sum();
+        data.put("storageUsed", formatFileSize(totalBytes));
+
+        // 最近 5 张上传
+        LambdaQueryWrapper<Photo> recentWp = new LambdaQueryWrapper<>();
+        applyViewerPermission(recentWp);
+        recentWp.orderByDesc(Photo::getCreatedAt).last("LIMIT 5");
+        List<Photo> recentPhotos = photoMapper.selectList(recentWp);
+        List<Map<String, Object>> recentList = recentPhotos.stream().map(p -> {
+            Map<String, Object> item = new HashMap<>();
+            item.put("id", p.getId());
+            item.put("title", p.getTitle());
+            item.put("url", accessUrlPrefix + p.getUrl());
+            String thumb = p.getThumbnailUrl();
+            item.put("thumbnailUrl", (thumb != null && !thumb.isEmpty()) ? (thumb.startsWith("http") ? thumb : accessUrlPrefix + thumb) : null);
+            item.put("createdAt", p.getCreatedAt() != null ? p.getCreatedAt().toString() : "");
+            // 填充分类名称
+            if (p.getCategoryId() != null) {
+                Category cat = categoryMapper.selectById(p.getCategoryId());
+                item.put("categoryName", cat != null ? cat.getName() : "");
+            } else {
+                item.put("categoryName", "");
+            }
+            return item;
+        }).collect(Collectors.toList());
+        data.put("recentPhotos", recentList);
+
+        // EXIF 统计分析
+        Map<String, Object> exifStats = new HashMap<>();
+
+        // 焦段分布
+        Map<String, Long> focalLengths = allPhotos.stream()
+                .filter(p -> p.getFocalLength() != null && !p.getFocalLength().isBlank())
+                .collect(Collectors.groupingBy(Photo::getFocalLength, Collectors.counting()));
+        exifStats.put("focalLengths", focalLengths);
+
+        // 相机型号分布（归一化：去空格、统一大写，避免 "PENTAX KS-2" 和 "Pentax K-S2" 被视为不同型号）
+        Map<String, Long> cameras = allPhotos.stream()
+                .filter(p -> p.getCameraModel() != null && !p.getCameraModel().isBlank())
+                .collect(Collectors.groupingBy(
+                        p -> p.getCameraModel().trim().replaceAll("\\s+", " ").toUpperCase(),
+                        Collectors.counting()));
+        exifStats.put("cameras", cameras);
+
+        // ISO 分布
+        Map<String, Long> isos = allPhotos.stream()
+                .filter(p -> p.getIso() != null && !p.getIso().isBlank())
+                .collect(Collectors.groupingBy(Photo::getIso, Collectors.counting()));
+        exifStats.put("isos", isos);
+
+        // 拍摄时间按年份分布（从 dateTaken 提取年份）
+        Map<String, Long> yearDistribution = allPhotos.stream()
+                .filter(p -> p.getDateTaken() != null && !p.getDateTaken().isBlank())
+                .map(p -> {
+                    String dateTaken = p.getDateTaken();
+                    // dateTaken 格式如 "2024:10:15 14:30:00" 或 "2024-10-15"
+                    if (dateTaken.length() >= 4) {
+                        return dateTaken.substring(0, 4);
+                    }
+                    return dateTaken;
+                })
+                .filter(year -> year.matches("\\d{4}"))
+                .collect(Collectors.groupingBy(year -> year, Collectors.counting()));
+        exifStats.put("yearDistribution", yearDistribution);
+
+        data.put("exifStats", exifStats);
+
+        return data;
+    }
+
+    /**
+     * 获取标签列表（含引用计数）
+     */
+    @Override
+    public List<Map<String, Object>> getTagList() {
+        LambdaQueryWrapper<Photo> wrapper = new LambdaQueryWrapper<>();
+        applyViewerPermission(wrapper);
+        List<Photo> allPhotos = photoMapper.selectList(wrapper);
+        Map<String, Long> tagCountMap = new HashMap<>();
+
+        for (Photo photo : allPhotos) {
+            String tagsStr = photo.getTags();
+            if (tagsStr == null || tagsStr.isBlank()) continue;
+            for (String tag : tagsStr.split(",")) {
+                String trimmed = tag.trim();
+                if (!trimmed.isEmpty()) {
+                    tagCountMap.merge(trimmed, 1L, Long::sum);
+                }
+            }
+        }
+
+        return tagCountMap.entrySet().stream()
+                .map(entry -> {
+                    Map<String, Object> item = new HashMap<>();
+                    item.put("name", entry.getKey());
+                    item.put("count", entry.getValue());
+                    return item;
+                })
+                .sorted((a, b) -> Long.compare(
+                        (Long) b.get("count"), (Long) a.get("count")))
+                .collect(Collectors.toList());
+    }
+
+    /**
+     * 批量更新照片（修改分类 + 追加标签）
+     */
+    @Override
+    @Transactional(rollbackFor = Exception.class)
+    public void batchUpdate(List<Long> ids, Long categoryId, String appendTags) {
+        if (ids == null || ids.isEmpty()) {
+            throw new BusinessException("请选择要编辑的照片");
+        }
+        if (ids.size() > 50) {
+            throw new BusinessException("单次最多编辑 50 张");
+        }
+
+        List<Photo> photos = photoMapper.selectBatchIds(ids);
+        for (Photo photo : photos) {
+            boolean modified = false;
+
+            // 修改分类
+            if (categoryId != null) {
+                photo.setCategoryId(categoryId);
+                modified = true;
+            }
+
+            // 追加标签（去重）
+            if (appendTags != null && !appendTags.isBlank()) {
+                String existingTags = photo.getTags() != null ? photo.getTags() : "";
+                Set<String> tagSet = new LinkedHashSet<>();
+                // 先收集已有标签
+                if (!existingTags.isBlank()) {
+                    for (String t : existingTags.split(",")) {
+                        String trimmed = t.trim();
+                        if (!trimmed.isEmpty()) tagSet.add(trimmed);
+                    }
+                }
+                // 追加新标签
+                for (String t : appendTags.split(",")) {
+                    String trimmed = t.trim();
+                    if (!trimmed.isEmpty()) tagSet.add(trimmed);
+                }
+                photo.setTags(String.join(",", tagSet));
+                modified = true;
+            }
+
+            if (modified) {
+                photo.setUpdatedAt(LocalDateTime.now());
+                photoMapper.updateById(photo);
+            }
+        }
+
+        log.info("批量编辑完成: ids={}, categoryId={}, appendTags={}", ids, categoryId, appendTags);
+    }
+
+    /**
+     * 获取所有有 GPS 坐标的照片
+     */
+    @Override
+    public List<PhotoDTO> getGpsPhotos() {
+        LambdaQueryWrapper<Photo> wrapper = new LambdaQueryWrapper<>();
+        wrapper.isNotNull(Photo::getGpsLatitude)
+                .isNotNull(Photo::getGpsLongitude);
+        applyViewerPermission(wrapper);
+        wrapper.orderByDesc(Photo::getCreatedAt);
+
+        List<Photo> photos = photoMapper.selectList(wrapper);
+        return photos.stream().map(this::toDTO).collect(Collectors.toList());
+    }
+
+    @Override
+    public Map<String, Object> getAdjacentIds(Long id) {
+        Map<String, Object> result = new HashMap<>();
+        // 上一条：id > 当前id的最小的一个
+        LambdaQueryWrapper<Photo> prevWp = new LambdaQueryWrapper<>();
+        prevWp.lt(Photo::getId, id);
+        applyViewerPermission(prevWp);
+        prevWp.orderByDesc(Photo::getId).last("LIMIT 1");
+        Photo prev = photoMapper.selectOne(prevWp);
+        result.put("prevId", prev != null ? prev.getId() : null);
+
+        // 下一条
+        LambdaQueryWrapper<Photo> nextWp = new LambdaQueryWrapper<>();
+        nextWp.gt(Photo::getId, id);
+        applyViewerPermission(nextWp);
+        nextWp.orderByAsc(Photo::getId).last("LIMIT 1");
+        Photo next = photoMapper.selectOne(nextWp);
+        result.put("nextId", next != null ? next.getId() : null);
+
+        return result;
+    }
+
+    /**
+     * 格式化文件大小
+     */
+    private String formatFileSize(long bytes) {
+        if (bytes < 1024) return bytes + " B";
+        if (bytes < 1024 * 1024) return String.format("%.1f KB", bytes / 1024.0);
+        if (bytes < 1024 * 1024 * 1024) return String.format("%.1f MB", bytes / (1024.0 * 1024));
+        return String.format("%.2f GB", bytes / (1024.0 * 1024 * 1024));
+    }
+
+    /**
+     * 批量删除
+     */
+    @Override
+    @Transactional(rollbackFor = Exception.class)
+    public void batchDelete(List<Long> ids) throws Exception {
+        for (Long id : ids) {
+            Photo photo = photoMapper.selectById(id);
+            if (photo == null) continue;
+            try {
+                deleteFile(photo.getUrl());
+            } catch (Exception e) {
+                log.warn("删除文件失败: {}", photo.getUrl(), e);
+            }
+        }
+        photoMapper.deleteBatchIds(ids);
+        log.info("批量删除完成: ids={}", ids);
+    }
+
+    // ========== 私有工具方法 ==========
+
+    /**
+     * 校验上传文件
+     */
+    private void validateFile(MultipartFile file) {
+        if (file.isEmpty()) {
+            throw new BusinessException("上传文件不能为空");
+        }
+
+        String originalName = file.getOriginalFilename();
+        String ext = getFileExtension(originalName).toLowerCase();
+        Set<String> allowedExt = Set.of(".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp");
+        if (!allowedExt.contains(ext)) {
+            throw new BusinessException("仅支持 JPG/PNG/WEBP/GIF/BMP 格式");
+        }
+    }
+
+    /**
+     * 从 COS 删除文件
+     */
+    private void deleteFile(String url) {
+        if (url == null || url.isBlank()) return;
+        try {
+            // 从完整 URL 提取 COS key
+            String key = url.replace(cosDomain + "/", "");
+            cosClient.deleteObject(cosBucket, key);
+        } catch (Exception e) {
+            log.warn("删除COS文件失败: {}", url, e);
+        }
+    }
+
+    /**
+     * 解析图片 EXIF 信息，返回包含 JSON 和结构化字段的 Map
+     *
+     * @param file 图片文件
+     * @return Map，key 包括:
+     *         "exifJson"      - 完整 EXIF JSON 字符串
+     *         "cameraModel"   - 相机型号
+     *         "aperture"      - 光圈值，如 f/2.8
+     *         "shutterSpeed"  - 快门速度，如 1/125s
+     *         "iso"           - ISO 感光度
+     *         "focalLength"   - 焦距，如 50mm
+     *         "dateTaken"     - 拍摄时间原始值
+     */
+    private Map<String, String> parseExif(java.io.File file) {
+        Map<String, Object> exif = new LinkedHashMap<>();
+        Map<String, String> result = new LinkedHashMap<>();
+        try {
+            Metadata metadata = ImageMetadataReader.readMetadata(file);
+
+            // 相机信息（IFD0）
+            ExifIFD0Directory ifd0 = metadata.getFirstDirectoryOfType(ExifIFD0Directory.class);
+            if (ifd0 != null) {
+                safePut(exif, "相机型号", ifd0, ExifIFD0Directory.TAG_MODEL);
+                safePut(exif, "制造商", ifd0, ExifIFD0Directory.TAG_MAKE);
+                // 结构化字段
+                result.put("cameraModel",
+                        extractTagString(ifd0, ExifIFD0Directory.TAG_MODEL));
+            } else {
+                result.put("cameraModel", "");
+            }
+
+            // 拍摄参数（Exif SubIFD）
+            ExifSubIFDDirectory subIfd = metadata.getFirstDirectoryOfType(ExifSubIFDDirectory.class);
+            if (subIfd != null) {
+                safePut(exif, "光圈", subIfd, ExifSubIFDDirectory.TAG_FNUMBER);
+                safePut(exif, "快门速度", subIfd, ExifSubIFDDirectory.TAG_EXPOSURE_TIME);
+                safePut(exif, "ISO", subIfd, ExifSubIFDDirectory.TAG_ISO_EQUIVALENT);
+                safePut(exif, "焦距", subIfd, ExifSubIFDDirectory.TAG_FOCAL_LENGTH);
+                safePut(exif, "拍摄时间", subIfd, ExifSubIFDDirectory.TAG_DATETIME_ORIGINAL);
+                safePut(exif, "曝光模式", subIfd, ExifSubIFDDirectory.TAG_EXPOSURE_MODE);
+                safePut(exif, "白平衡", subIfd, ExifSubIFDDirectory.TAG_WHITE_BALANCE_MODE);
+                safePut(exif, "闪光灯", subIfd, ExifSubIFDDirectory.TAG_FLASH);
+                // 结构化字段
+                result.put("aperture",
+                        extractTagString(subIfd, ExifSubIFDDirectory.TAG_FNUMBER));
+                result.put("shutterSpeed",
+                        formatShutterSpeed(extractTagString(subIfd, ExifSubIFDDirectory.TAG_EXPOSURE_TIME)));
+                result.put("iso",
+                        extractTagString(subIfd, ExifSubIFDDirectory.TAG_ISO_EQUIVALENT));
+                result.put("focalLength",
+                        formatFocalLength(extractTagString(subIfd, ExifSubIFDDirectory.TAG_FOCAL_LENGTH)));
+                result.put("dateTaken",
+                        extractTagString(subIfd, ExifSubIFDDirectory.TAG_DATETIME_ORIGINAL));
+            } else {
+                result.put("aperture", "");
+                result.put("shutterSpeed", "");
+                result.put("iso", "");
+                result.put("focalLength", "");
+                result.put("dateTaken", "");
+            }
+
+            // GPS 信息
+            GpsDirectory gpsDir = metadata.getFirstDirectoryOfType(GpsDirectory.class);
+            if (gpsDir != null && gpsDir.getGeoLocation() != null) {
+                result.put("gpsLatitude", String.valueOf(gpsDir.getGeoLocation().getLatitude()));
+                result.put("gpsLongitude", String.valueOf(gpsDir.getGeoLocation().getLongitude()));
+            } else {
+                result.put("gpsLatitude", "");
+                result.put("gpsLongitude", "");
+            }
+
+            result.put("exifJson", exif.isEmpty() ? null : objectMapper.writeValueAsString(exif));
+            return result;
+        } catch (Exception e) {
+            log.debug("EXIF 解析失败: {}", e.getMessage());
+            result.put("exifJson", null);
+            return result;
+        }
+    }
+
+    /**
+     * 安全地从 Directory 中提取标签原始字符串值
+     *
+     * @param dir     EXIF 目录
+     * @param tagType 标签类型
+     * @return 标签字符串值，若不存在则返回 ""
+     */
+    private String extractTagString(Directory dir, int tagType) {
+        try {
+            String value = dir.getString(tagType);
+            return (value != null && !value.isBlank()) ? value : "";
+        } catch (Exception ignored) {
+            return "";
+        }
+    }
+
+    /**
+     * 格式化快门速度字符串，将 "1/125 sec" 转为 "1/125s"
+     */
+    private String formatShutterSpeed(String value) {
+        if (value == null || value.isEmpty()) return "";
+        return value.replace(" sec", "s");
+    }
+
+    /**
+     * 安全解析 Decimal 字符串为 Double，用于 GPS 坐标
+     */
+    private Double parseDecimal(String value) {
+        if (value == null || value.isEmpty()) return null;
+        try {
+            return Double.parseDouble(value);
+        } catch (NumberFormatException e) {
+            return null;
+        }
+    }
+
+    /**
+     * 格式化焦距字符串，将 "50.0 mm" 转为 "50mm"
+     */
+    private String formatFocalLength(String value) {
+        if (value == null || value.isEmpty()) return "";
+        return value.replace(" ", "");
+    }
+
+    /**
+     * 安全地从 Directory 中提取标签值并放入 Map
+     */
+    private void safePut(Map<String, Object> map, String key, Directory dir, int tagType) {
+        try {
+            String value = dir.getString(tagType);
+            if (value != null && !value.isBlank()) {
+                // 格式化快门速度（如 "1/125 sec" → "1/125s"）
+                if (tagType == ExifSubIFDDirectory.TAG_EXPOSURE_TIME) {
+                    value = value.replace(" sec", "s");
+                }
+                // 格式化焦距（如 "50.0 mm" → "50mm"）
+                if (tagType == ExifSubIFDDirectory.TAG_FOCAL_LENGTH) {
+                    value = value.replace(" ", "");
+                }
+                map.put(key, value);
+            }
+        } catch (Exception ignored) {
+            // 该标签不存在则跳过
+        }
+    }
+
+    private String getFileExtension(String filename) {
+        if (filename == null || !filename.contains(".")) return "";
+        return filename.substring(filename.lastIndexOf(".")).toLowerCase();
+    }
+
+    /**
+     * 点赞照片，返回最新点赞数
+     */
+    public int likePhoto(Long id) {
+        Photo photo = photoMapper.selectById(id);
+        if (photo == null) throw new BusinessException("照片不存在");
+        int newCount = (photo.getLikeCount() == null ? 0 : photo.getLikeCount()) + 1;
+        Photo update = new Photo();
+        update.setId(id);
+        update.setLikeCount(newCount);
+        photoMapper.updateById(update);
+        return newCount;
+    }
+
+    /**
+     * Entity -> DTO 转换，补充分类名称和完整访问URL
+     */
+    public PhotoDTO toDTO(Photo photo) {
+        PhotoDTO dto = new PhotoDTO();
+        dto.setId(photo.getId());
+        dto.setTitle(photo.getTitle());
+        dto.setDescription(photo.getDescription());
+        dto.setCategoryId(photo.getCategoryId());
+        // COS 已含完整域名，本地路径需拼接前缀
+        String url = photo.getUrl();
+        dto.setUrl(url != null && url.startsWith("http") ? url : accessUrlPrefix + url);
+        String thumbUrl = photo.getThumbnailUrl();
+        dto.setThumbnailUrl(thumbUrl != null && !thumbUrl.isEmpty()
+                ? (thumbUrl.startsWith("http") ? thumbUrl : accessUrlPrefix + thumbUrl) : null);
+        dto.setFileName(photo.getFileName());
+        dto.setFileSize(photo.getFileSize());
+        dto.setTags(photo.getTags());
+        dto.setIsPrivate(photo.getIsPrivate());
+        dto.setViewCount(photo.getViewCount());
+        dto.setLikeCount(photo.getLikeCount());
+        dto.setExifInfo(photo.getExifInfo());
+        dto.setCameraModel(photo.getCameraModel());
+        dto.setAperture(photo.getAperture());
+        dto.setShutterSpeed(photo.getShutterSpeed());
+        dto.setIso(photo.getIso());
+        dto.setFocalLength(photo.getFocalLength());
+        dto.setDateTaken(photo.getDateTaken());
+        dto.setGpsLatitude(photo.getGpsLatitude());
+        dto.setGpsLongitude(photo.getGpsLongitude());
+
+        // 填充分类名称
+        if (photo.getCategoryId() != null) {
+            Category cat = categoryMapper.selectById(photo.getCategoryId());
+            if (cat != null) {
+                dto.setCategoryName(cat.getName());
+            }
+        }
+        return dto;
+    }
+}

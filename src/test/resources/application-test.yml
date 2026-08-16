@@ -1,0 +1,48 @@
+server:
+  port: 8080
+
+spring:
+  datasource:
+    url: jdbc:h2:mem:photo_album_test;DB_CLOSE_DELAY=-1;MODE=MySQL
+    driver-class-name: org.h2.Driver
+    username: sa
+    password:
+
+  # H2 控制台（调试用）
+  h2:
+    console:
+      enabled: true
+      path: /h2-console
+
+  # 文件上传
+  servlet:
+    multipart:
+      max-file-size: 10MB
+      max-request-size: 50MB
+
+mybatis-plus:
+  mapper-locations: classpath*:/mapper/**/*.xml
+  type-aliases-package: com.photoalbum.entity
+  configuration:
+    map-underscore-to-camel-case: true
+  global-config:
+    db-config:
+      # H2 兼容 MySQL 模式
+      id-type: auto
+
+# JWT 配置（测试用）
+jwt:
+  secret: TestSecretKeyForJwtTokenGenerationMustBeLongEnough!
+  expiration: 86400000
+  header: Authorization
+
+# 文件上传配置（使用临时目录）
+file:
+  upload-dir: ${java.io.tmpdir}/photo-test-uploads/
+  access-url-prefix: /files/
+
+# 日志
+logging:
+  level:
+    com.photoalbum: debug
+    org.springframework.security: warn
