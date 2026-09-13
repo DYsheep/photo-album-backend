@@ -4,12 +4,10 @@ import com.photoalbum.common.Result;
 import com.photoalbum.dto.PhotoDTO;
 import com.photoalbum.entity.Category;
 import com.photoalbum.entity.Photo;
-import com.photoalbum.entity.User;
 import com.photoalbum.mapper.CategoryMapper;
 import com.photoalbum.service.PhotoService;
 import lombok.RequiredArgsConstructor;
-import org.springframework.security.core.Authentication;
-import org.springframework.security.core.context.SecurityContextHolder;
+import org.springframework.security.access.prepost.PreAuthorize;
 import org.springframework.web.bind.annotation.*;
 import org.springframework.web.multipart.MultipartFile;
 
@@ -40,10 +38,13 @@ public class PhotoController {
 
     /**
      * 照片详情
+     *
+     * 可见性规则与列表接口保持一致：无权限访问私密照片时按 404 处理，
+     * 既不返回内容也不暴露该 ID 是否存在（修复 IDOR 越权读取）。
      */
     @GetMapping("/{id}")
     public Result<PhotoDTO> detail(@PathVariable Long id) {
-        Photo photo = photoService.getById(id);
+        Photo photo = photoService.getVisiblePhoto(id);
         if (photo == null) {
             return Result.fail(404, "照片不存在");
         }
@@ -58,8 +59,11 @@ public class PhotoController {
     /**
      * 上传图片（支持多字段表单数据）
      * POST /api/photos/upload (multipart/form-data)
+     *
+     * 需具备上传权限（photo:upload = 管理员或 canUpload）。
      */
     @PostMapping("/upload")
+    @PreAuthorize("hasAuthority('photo:upload')")
     public Result<PhotoDTO> upload(
             @RequestParam("file") MultipartFile file,
             @RequestParam(value = "title", required = false) String title,
@@ -68,44 +72,43 @@ public class PhotoController {
             @RequestParam(value = "tags", required = false) String tags,
             @RequestParam(value = "isPrivate", required = false, defaultValue = "0") Integer isPrivate,
             @RequestParam(value = "collectionId", required = false) Long collectionId) throws Exception {
-        checkUploadPermission();
         PhotoDTO result = photoService.upload(file, title, categoryId, collectionId, description, tags, isPrivate);
         return Result.ok(result);
     }
 
     /**
      * 修改照片信息
+     *
+     * 需具备管理权限（photo:manage = 管理员或 canManage）。
      */
     @PutMapping("/{id}")
+    @PreAuthorize("hasAuthority('photo:manage')")
     public Result<Void> update(@PathVariable Long id, @RequestBody PhotoDTO dto) {
-        try {
-            checkManagePermission();
-            photoService.updatePhoto(id, dto);
-            return Result.ok();
-        } catch (com.photoalbum.common.BusinessException e) {
-            return Result.fail(e.getCode(), e.getMessage());
-        }
+        photoService.updatePhoto(id, dto);
+        return Result.ok();
     }
 
     /**
      * 删除单张照片
+     *
+     * 破坏性操作需具备管理权限（此前仅要求"已登录"，任一低权限账号即可删除全站照片）。
      */
     @DeleteMapping("/{id}")
-    public Result<Void> delete(@PathVariable Long id) {
-        try {
-            photoService.deletePhoto(id);
-            return Result.ok();
-        } catch (Exception e) {
-            return Result.fail(e.getMessage());
-        }
+    @PreAuthorize("hasAuthority('photo:manage')")
+    public Result<Void> delete(@PathVariable Long id) throws Exception {
+        photoService.deletePhoto(id);
+        return Result.ok();
     }
 
     /**
      * 批量删除
      * DELETE /api/photos/batch  Body: { ids: [1,2,3] }
+     *
+     * 需具备管理权限（此前仅要求"已登录"）。
      */
     @DeleteMapping("/batch")
-    public Result<Void> batchDelete(@RequestBody Map<String, List<Long>> body) {
+    @PreAuthorize("hasAuthority('photo:manage')")
+    public Result<Void> batchDelete(@RequestBody Map<String, List<Long>> body) throws Exception {
         List<Long> ids = body.get("ids");
         if (ids == null || ids.isEmpty()) {
             return Result.fail("请选择要删除的照片");
@@ -113,12 +116,8 @@ public class PhotoController {
         if (ids.size() > 50) {
             return Result.fail("单次最多删除 50 张");
         }
-        try {
-            photoService.batchDelete(ids);
-            return Result.ok();
-        } catch (Exception e) {
-            return Result.fail(e.getMessage());
-        }
+        photoService.batchDelete(ids);
+        return Result.ok();
     }
 
     /**
@@ -164,8 +163,11 @@ public class PhotoController {
     /**
      * 批量编辑照片
      * PUT /api/photos/batch  Body: {ids:[1,2,3], categoryId:5, appendTags:"新标签"}
+     *
+     * 需具备管理权限（此前仅要求"已登录"）。
      */
     @PutMapping("/batch")
+    @PreAuthorize("hasAuthority('photo:manage')")
     public Result<Void> batchUpdate(@RequestBody Map<String, Object> body) {
         @SuppressWarnings("unchecked")
         List<Integer> idsInt = (List<Integer>) body.get("ids");
@@ -182,12 +184,8 @@ public class PhotoController {
 
         String appendTags = (String) body.get("appendTags");
 
-        try {
-            photoService.batchUpdate(ids, categoryId, appendTags);
-            return Result.ok();
-        } catch (Exception e) {
-            return Result.fail(e.getMessage());
-        }
+        photoService.batchUpdate(ids, categoryId, appendTags);
+        return Result.ok();
     }
 
     // ========== 私有工具方法 ==========
@@ -238,26 +236,5 @@ public class PhotoController {
     public Result<Integer> like(@PathVariable Long id) {
         int count = photoService.likePhoto(id);
         return Result.ok(count);
-    }
-
-    private User getCurrentUser() {
-        Authentication auth = SecurityContextHolder.getContext().getAuthentication();
-        if (auth != null && auth.getPrincipal() instanceof User) return (User) auth.getPrincipal();
-        return null;
-    }
-    private boolean isAdmin() { User u = getCurrentUser(); return u != null && "admin".equals(u.getRole()); }
-    private void checkUploadPermission() {
-        User u = getCurrentUser();
-        if (u == null) throw new RuntimeException("未登录");
-        if (isAdmin()) return;
-        if (u.getCanUpload() == null || u.getCanUpload() != 1)
-            throw new RuntimeException("无上传权限");
-    }
-    private void checkManagePermission() {
-        User u = getCurrentUser();
-        if (u == null) throw new RuntimeException("未登录");
-        if (isAdmin()) return;
-        if (u.getCanManage() == null || u.getCanManage() != 1)
-            throw new RuntimeException("无管理权限");
     }
 }

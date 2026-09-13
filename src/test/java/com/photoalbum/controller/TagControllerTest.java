@@ -2,13 +2,17 @@ package com.photoalbum.controller;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.photoalbum.entity.Photo;
+import com.photoalbum.entity.User;
 import com.photoalbum.mapper.PhotoMapper;
+import com.photoalbum.security.UserAuthorities;
 import org.junit.jupiter.api.*;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.autoconfigure.web.servlet.AutoConfigureMockMvc;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.mock.mockito.MockBean;
 import org.springframework.http.MediaType;
+import org.springframework.security.authentication.UsernamePasswordAuthenticationToken;
+import org.springframework.security.core.context.SecurityContextHolder;
 import org.springframework.test.context.ActiveProfiles;
 import org.springframework.test.web.servlet.MockMvc;
 
@@ -22,6 +26,8 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 /**
  * TagController 集成测试
  * 使用 @SpringBootTest + H2 测试环境 + MockMvc，关闭 Security Filter 以隔离测试 Controller 逻辑
+ *
+ * 标签接口位于 /api/admin/tags，需要 photo:manage 权限，测试以管理员身份执行。
  */
 @SpringBootTest
 @AutoConfigureMockMvc(addFilters = false)
@@ -37,6 +43,23 @@ class TagControllerTest {
 
     @MockBean
     private PhotoMapper photoMapper;
+
+    @BeforeEach
+    void loginAsAdmin() {
+        User user = new User();
+        user.setId(1L);
+        user.setUsername("tester");
+        user.setRole("admin");
+        user.setCanUpload(1);
+        user.setCanManage(1);
+        SecurityContextHolder.getContext().setAuthentication(
+                new UsernamePasswordAuthenticationToken(user, null, UserAuthorities.of(user)));
+    }
+
+    @AfterEach
+    void clearSecurityContext() {
+        SecurityContextHolder.clearContext();
+    }
 
     // ============================================================
     // GET /api/admin/tags - 标签列表

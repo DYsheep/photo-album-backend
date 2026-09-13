@@ -4,7 +4,9 @@ import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.photoalbum.dto.CategoryDTO;
 import com.photoalbum.entity.Category;
+import com.photoalbum.entity.User;
 import com.photoalbum.mapper.PhotoMapper;
+import com.photoalbum.security.UserAuthorities;
 import com.photoalbum.service.CategoryService;
 import org.junit.jupiter.api.*;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -12,6 +14,8 @@ import org.springframework.boot.test.autoconfigure.web.servlet.AutoConfigureMock
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.mock.mockito.MockBean;
 import org.springframework.http.MediaType;
+import org.springframework.security.authentication.UsernamePasswordAuthenticationToken;
+import org.springframework.security.core.context.SecurityContextHolder;
 import org.springframework.test.context.ActiveProfiles;
 import org.springframework.test.web.servlet.MockMvc;
 
@@ -29,6 +33,8 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 /**
  * CategoryController 集成测试
  * 使用 @SpringBootTest + H2 测试环境 + MockMvc
+ *
+ * 分类写接口需要 photo:manage 权限，因此测试以管理员身份执行（权限校验本身的用例见 PhotoControllerTest）。
  */
 @SpringBootTest
 @AutoConfigureMockMvc(addFilters = false)
@@ -47,6 +53,23 @@ class CategoryControllerTest {
 
     @MockBean
     private PhotoMapper photoMapper;
+
+    @BeforeEach
+    void loginAsAdmin() {
+        User user = new User();
+        user.setId(1L);
+        user.setUsername("tester");
+        user.setRole("admin");
+        user.setCanUpload(1);
+        user.setCanManage(1);
+        SecurityContextHolder.getContext().setAuthentication(
+                new UsernamePasswordAuthenticationToken(user, null, UserAuthorities.of(user)));
+    }
+
+    @AfterEach
+    void clearSecurityContext() {
+        SecurityContextHolder.clearContext();
+    }
 
     // ============================================================
     // GET /api/categories 测试

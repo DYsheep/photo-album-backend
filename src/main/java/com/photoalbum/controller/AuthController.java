@@ -9,6 +9,7 @@ import com.photoalbum.service.UserService;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.validation.Valid;
 import lombok.RequiredArgsConstructor;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.web.bind.annotation.*;
 
@@ -26,6 +27,10 @@ public class AuthController {
     private final UserService userService;
     private final PasswordEncoder passwordEncoder;
     private final JwtUtil jwtUtil;
+
+    /** 是否信任反向代理写入的来源地址头（部署在 Nginx 之后时为 true） */
+    @Value("${app.security.trust-proxy:true}")
+    private boolean trustProxy;
 
     /**
      * 登录
@@ -99,19 +104,32 @@ public class AuthController {
         return info;
     }
 
-    /** 获取客户端真实 IP（考虑代理） */
+    /**
+     * 获取客户端真实 IP（用于登录限流）
+     *
+     * 安全说明（修复 V07 绕过部分）：
+     * Nginx 以"追加"方式写入 X-Forwarded-For 时，该头最左侧字段由客户端提供、可任意伪造，
+     * 因此必须取最右侧（由本机代理写入的）地址；取最左值会使攻击者通过每次伪造不同的头
+     * 绕过"每 IP 每分钟 5 次"的登录限流。
+     * 服务未部署在反向代理之后时，请将 app.security.trust-proxy 设为 false，直接采用连接对端地址。
+     */
     private String getClientIp(HttpServletRequest request) {
-        String ip = request.getHeader("X-Forwarded-For");
-        if (ip == null || ip.isEmpty() || "unknown".equalsIgnoreCase(ip)) {
-            ip = request.getHeader("X-Real-IP");
+        if (trustProxy) {
+            String forwarded = request.getHeader("X-Forwarded-For");
+            if (forwarded != null && !forwarded.isBlank()) {
+                String[] parts = forwarded.split(",");
+                for (int i = parts.length - 1; i >= 0; i--) {
+                    String candidate = parts[i].trim();
+                    if (!candidate.isEmpty() && !"unknown".equalsIgnoreCase(candidate)) {
+                        return candidate;
+                    }
+                }
+            }
+            String realIp = request.getHeader("X-Real-IP");
+            if (realIp != null && !realIp.isBlank() && !"unknown".equalsIgnoreCase(realIp)) {
+                return realIp.trim();
+            }
         }
-        if (ip == null || ip.isEmpty() || "unknown".equalsIgnoreCase(ip)) {
-            ip = request.getRemoteAddr();
-        }
-        // X-Forwarded-For 可能包含多个 IP，取第一个
-        if (ip != null && ip.contains(",")) {
-            ip = ip.split(",")[0].trim();
-        }
-        return ip;
+        return request.getRemoteAddr();
     }
 }

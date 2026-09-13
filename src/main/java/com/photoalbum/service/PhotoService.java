@@ -62,6 +62,15 @@ public interface PhotoService extends IService<Photo> {
      */
     Map<String, Object> getAdjacentIds(Long id);
 
+    /**
+     * 按可见性查询单张照片（详情接口使用）
+     *
+     * 与列表接口使用同一套可见性规则：未登录与普通用户仅可见公开照片，
+     * viewer 角色按白名单/黑名单过滤，admin 全量可见。
+     * 无权限访问私密照片时返回 null（调用方应返回 404，避免暴露资源存在性）。
+     */
+    Photo getVisiblePhoto(Long id);
+
     /** Entity → DTO 转换，供 Controller 复用 */
     PhotoDTO toDTO(Photo photo);
 

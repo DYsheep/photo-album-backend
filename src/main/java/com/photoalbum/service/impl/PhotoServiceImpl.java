@@ -4,24 +4,23 @@ import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
 import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
 import com.photoalbum.common.BusinessException;
+import com.photoalbum.common.UserRoles;
 import com.photoalbum.dto.PhotoDTO;
 import com.photoalbum.entity.Category;
 import com.photoalbum.entity.Photo;
 import com.photoalbum.entity.PhotoCollectionPhoto;
 import com.photoalbum.entity.ShareLink;
 import com.photoalbum.entity.User;
-import com.photoalbum.entity.UserPermission;
 import com.photoalbum.mapper.CategoryMapper;
 import com.photoalbum.mapper.PhotoCollectionPhotoMapper;
 import com.photoalbum.mapper.PhotoMapper;
 import com.photoalbum.mapper.ShareLinkMapper;
-import com.photoalbum.mapper.UserPermissionMapper;
+import com.photoalbum.security.AccessPolicy;
+import com.photoalbum.security.CurrentUserSupport;
 import com.photoalbum.service.PhotoService;
 import com.qcloud.cos.COSClient;
 import com.qcloud.cos.model.ObjectMetadata;
 import com.qcloud.cos.model.PutObjectRequest;
-import org.springframework.security.core.Authentication;
-import org.springframework.security.core.context.SecurityContextHolder;
 import com.drew.imaging.ImageMetadataReader;
 import com.drew.metadata.Directory;
 import com.drew.metadata.Metadata;
@@ -66,7 +65,7 @@ public class PhotoServiceImpl extends ServiceImpl<PhotoMapper, Photo> implements
     private final CategoryMapper categoryMapper;
     private final PhotoCollectionPhotoMapper collectionPhotoMapper;
     private final ShareLinkMapper shareLinkMapper;
-    private final UserPermissionMapper permMapper;
+    private final AccessPolicy accessPolicy;
     private final COSClient cosClient;
     private final ObjectMapper objectMapper = new ObjectMapper();
 
@@ -79,76 +78,33 @@ public class PhotoServiceImpl extends ServiceImpl<PhotoMapper, Photo> implements
     @Value("${file.access-url-prefix}")
     private String accessUrlPrefix;
 
-    /** 当前用户是否为管理员（role == admin） */
+    /**
+     * 单文件大小上限（MB）。
+     * 保留 Java 初始值，便于不经 Spring 注入的单元测试使用；
+     * 生产环境通过 file.max-size-mb（或环境变量 FILE_MAX_SIZE_MB）覆盖。
+     */
+    @Value("${file.max-size-mb:10}")
+    private int maxSizeMb = 10;
+
+    /**
+     * 扩展名 → 服务端认定的内容类型（不采信客户端提交的 Content-Type）
+     */
+    private static final Map<String, String> EXT_CONTENT_TYPE = Map.of(
+            ".jpg", "image/jpeg",
+            ".jpeg", "image/jpeg",
+            ".png", "image/png",
+            ".gif", "image/gif",
+            ".webp", "image/webp",
+            ".bmp", "image/bmp");
+
+    /** 当前用户是否为管理员（角色判定，与可见性策略口径一致） */
     private boolean isAdmin() {
         User user = getCurrentUser();
-        return user != null && "admin".equals(user.getRole());
-    }
-
-    private boolean canViewPrivate() {
-        User user = getCurrentUser();
-        return user != null && ("admin".equals(user.getRole()) || "viewer".equals(user.getRole()));
-    }
-
-    private void applyViewerPermission(LambdaQueryWrapper<Photo> wrapper) {
-        if (!canViewPrivate()) { wrapper.eq(Photo::getIsPrivate, 0); return; }
-        if (isAdmin()) return;
-        User user = getCurrentUser();
-        if (user == null) return;
-
-        // 1. 加载该用户的全部权限条目
-        List<UserPermission> allPerms = permMapper.selectList(
-            new LambdaQueryWrapper<UserPermission>().eq(UserPermission::getUserId, user.getId()));
-        if (allPerms.isEmpty()) return;
-
-        // 2. 拆分照片级和合集级权限
-        List<Long> photoWhitelist = new ArrayList<>();
-        List<Long> photoBlacklist = new ArrayList<>();
-        List<Long> collectionWhitelist = new ArrayList<>();
-        List<Long> collectionBlacklist = new ArrayList<>();
-        for (UserPermission p : allPerms) {
-            boolean isWhite = "W".equals(p.getPermType());
-            if ("photo".equals(p.getTargetType())) {
-                if (isWhite) photoWhitelist.add(p.getTargetId()); else photoBlacklist.add(p.getTargetId());
-            } else if ("collection".equals(p.getTargetType())) {
-                if (isWhite) collectionWhitelist.add(p.getTargetId()); else collectionBlacklist.add(p.getTargetId());
-            }
-        }
-
-        // 3. 合集权限级联到内部照片
-        if (!collectionWhitelist.isEmpty()) {
-            List<Long> cascadeIds = getPhotoIdsInCollections(collectionWhitelist);
-            photoWhitelist.addAll(cascadeIds);
-        }
-        if (!collectionBlacklist.isEmpty()) {
-            List<Long> cascadeIds = getPhotoIdsInCollections(collectionBlacklist);
-            photoBlacklist.addAll(cascadeIds);
-        }
-
-        // 4. 应用过滤
-        if (!photoWhitelist.isEmpty()) {
-            wrapper.and(w -> w.eq(Photo::getIsPrivate, 0).or().in(Photo::getId, photoWhitelist));
-        } else if (!photoBlacklist.isEmpty()) {
-            wrapper.and(w -> w.eq(Photo::getIsPrivate, 0)
-                .or(w2 -> w2.eq(Photo::getIsPrivate, 1).notIn(Photo::getId, photoBlacklist)));
-        }
-    }
-
-    /** 获取指定合集下的所有照片 ID */
-    private List<Long> getPhotoIdsInCollections(List<Long> collectionIds) {
-        if (collectionIds.isEmpty()) return List.of();
-        return collectionPhotoMapper.selectList(
-                new LambdaQueryWrapper<PhotoCollectionPhoto>()
-                    .in(PhotoCollectionPhoto::getCollectionId, collectionIds))
-            .stream().map(PhotoCollectionPhoto::getPhotoId).distinct().collect(Collectors.toList());
+        return user != null && UserRoles.isAdmin(user.getRole());
     }
 
     private User getCurrentUser() {
-        Authentication auth = SecurityContextHolder.getContext().getAuthentication();
-        if (auth == null || !auth.isAuthenticated()) return null;
-        Object principal = auth.getPrincipal();
-        if (principal instanceof User) return (User) principal;
-        return null;
+        return CurrentUserSupport.getCurrentUser();
     }
 
     /**
@@ -175,7 +131,7 @@ public class PhotoServiceImpl extends ServiceImpl<PhotoMapper, Photo> implements
         }
 
         // 非管理员看不到私密照片
-        applyViewerPermission(wrapper);
+        accessPolicy.applyPhotoFilter(wrapper, getCurrentUser());
 
         wrapper.orderByDesc(Photo::getCreatedAt);
 
@@ -207,9 +163,13 @@ public class PhotoServiceImpl extends ServiceImpl<PhotoMapper, Photo> implements
 
         byte[] fileBytes = file.getBytes();
 
+        // 内容类型由服务端按扩展名白名单确定，不采信客户端提交值：
+        // 否则可上传扩展名为图片、内容类型为 text/html 的文件，使其在对象存储域名下被当作网页解析
+        String contentType = EXT_CONTENT_TYPE.getOrDefault(ext, "application/octet-stream");
+
         // 上传原图到 COS
         String cosKey = dateDir + "/" + uuidName;
-        uploadToCos(fileBytes, cosKey, file.getContentType());
+        uploadToCos(fileBytes, cosKey, contentType);
 
         // 生成缩略图并上传（800px 宽，高画质）
         String thumbKey = dateDir + "/thumb_" + uuidName.replaceFirst("\\.[^.]+$", ".jpg");
@@ -218,11 +178,18 @@ public class PhotoServiceImpl extends ServiceImpl<PhotoMapper, Photo> implements
             uploadToCos(thumbBytes, thumbKey, "image/jpeg");
         }
 
-        // EXIF 解析（用临时文件）
-        File tmpFile = File.createTempFile("upload_", ext);
-        file.transferTo(tmpFile);
-        Map<String, String> exifData = parseExif(tmpFile);
-        tmpFile.delete();
+        // EXIF 解析（用临时文件；无论成功或异常都必须清理，避免临时目录堆积）
+        Map<String, String> exifData;
+        File tmpFile = null;
+        try {
+            tmpFile = File.createTempFile("upload_", ext);
+            file.transferTo(tmpFile);
+            exifData = parseExif(tmpFile);
+        } finally {
+            if (tmpFile != null && tmpFile.exists() && !tmpFile.delete()) {
+                log.warn("临时文件清理失败: {}", tmpFile.getAbsolutePath());
+            }
+        }
 
         Photo photo = new Photo();
         photo.setTitle(title != null ? title : originalName);
@@ -386,7 +353,7 @@ public class PhotoServiceImpl extends ServiceImpl<PhotoMapper, Photo> implements
 
         // 最近 5 张上传
         LambdaQueryWrapper<Photo> recentWp = new LambdaQueryWrapper<>();
-        applyViewerPermission(recentWp);
+        accessPolicy.applyPhotoFilter(recentWp, getCurrentUser());
         recentWp.orderByDesc(Photo::getCreatedAt).last("LIMIT 5");
         List<Photo> recentPhotos = photoMapper.selectList(recentWp);
         List<Map<String, Object>> recentList = recentPhotos.stream().map(p -> {
@@ -457,7 +424,7 @@ public class PhotoServiceImpl extends ServiceImpl<PhotoMapper, Photo> implements
     @Override
     public List<Map<String, Object>> getTagList() {
         LambdaQueryWrapper<Photo> wrapper = new LambdaQueryWrapper<>();
-        applyViewerPermission(wrapper);
+        accessPolicy.applyPhotoFilter(wrapper, getCurrentUser());
         List<Photo> allPhotos = photoMapper.selectList(wrapper);
         Map<String, Long> tagCountMap = new HashMap<>();
 
@@ -544,7 +511,7 @@ public class PhotoServiceImpl extends ServiceImpl<PhotoMapper, Photo> implements
         LambdaQueryWrapper<Photo> wrapper = new LambdaQueryWrapper<>();
         wrapper.isNotNull(Photo::getGpsLatitude)
                 .isNotNull(Photo::getGpsLongitude);
-        applyViewerPermission(wrapper);
+        accessPolicy.applyPhotoFilter(wrapper, getCurrentUser());
         wrapper.orderByDesc(Photo::getCreatedAt);
 
         List<Photo> photos = photoMapper.selectList(wrapper);
@@ -557,7 +524,7 @@ public class PhotoServiceImpl extends ServiceImpl<PhotoMapper, Photo> implements
         // 上一条：id > 当前id的最小的一个
         LambdaQueryWrapper<Photo> prevWp = new LambdaQueryWrapper<>();
         prevWp.lt(Photo::getId, id);
-        applyViewerPermission(prevWp);
+        accessPolicy.applyPhotoFilter(prevWp, getCurrentUser());
         prevWp.orderByDesc(Photo::getId).last("LIMIT 1");
         Photo prev = photoMapper.selectOne(prevWp);
         result.put("prevId", prev != null ? prev.getId() : null);
@@ -565,12 +532,28 @@ public class PhotoServiceImpl extends ServiceImpl<PhotoMapper, Photo> implements
         // 下一条
         LambdaQueryWrapper<Photo> nextWp = new LambdaQueryWrapper<>();
         nextWp.gt(Photo::getId, id);
-        applyViewerPermission(nextWp);
+        accessPolicy.applyPhotoFilter(nextWp, getCurrentUser());
         nextWp.orderByAsc(Photo::getId).last("LIMIT 1");
         Photo next = photoMapper.selectOne(nextWp);
         result.put("nextId", next != null ? next.getId() : null);
 
         return result;
+    }
+
+    /**
+     * 按可见性查询单张照片（详情接口使用）
+     *
+     * 与列表接口复用同一套可见性规则（applyViewerPermission）：
+     * 未登录与普通用户仅可见公开照片，viewer 角色按白名单/黑名单过滤，admin 全量可见。
+     * 无权限访问私密照片时返回 null，由调用方按 404 处理以避免暴露资源存在性。
+     */
+    @Override
+    public Photo getVisiblePhoto(Long id) {
+        if (id == null) {
+            return null;
+        }
+        Photo photo = photoMapper.selectById(id);
+        return accessPolicy.canViewPhoto(getCurrentUser(), photo) ? photo : null;
     }
 
     /**
@@ -606,18 +589,65 @@ public class PhotoServiceImpl extends ServiceImpl<PhotoMapper, Photo> implements
 
     /**
      * 校验上传文件
+     *
+     * 依次校验：非空 → 扩展名白名单 → 大小上限 → 文件头魔数（真实类型）。
+     * 仅校验扩展名不足以阻止"伪装成图片的网页/脚本文件"被写入对象存储。
      */
     private void validateFile(MultipartFile file) {
-        if (file.isEmpty()) {
+        if (file == null || file.isEmpty()) {
             throw new BusinessException("上传文件不能为空");
         }
 
         String originalName = file.getOriginalFilename();
-        String ext = getFileExtension(originalName).toLowerCase();
-        Set<String> allowedExt = Set.of(".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp");
-        if (!allowedExt.contains(ext)) {
+        String ext = getFileExtension(originalName);
+        if (!EXT_CONTENT_TYPE.containsKey(ext)) {
             throw new BusinessException("仅支持 JPG/PNG/WEBP/GIF/BMP 格式");
         }
+
+        long maxBytes = (long) maxSizeMb * 1024 * 1024;
+        if (file.getSize() > maxBytes) {
+            throw new BusinessException("文件大小不能超过 " + maxSizeMb + "MB");
+        }
+
+        byte[] head = new byte[12];
+        int read;
+        try (java.io.InputStream in = file.getInputStream()) {
+            read = in.readNBytes(head, 0, head.length);
+        } catch (IOException e) {
+            log.warn("上传文件读取失败: {}", e.getMessage());
+            throw new BusinessException("文件读取失败，请重试");
+        }
+        if (!matchesImageSignature(head, read)) {
+            throw new BusinessException("文件内容不是有效的图片");
+        }
+    }
+
+    /**
+     * 文件头（魔数）校验：确认文件内容确为允许的图片类型
+     *
+     * @param head   文件头字节
+     * @param length 实际读取到的字节数
+     */
+    private boolean matchesImageSignature(byte[] head, int length) {
+        // JPEG: FF D8 FF
+        if (length >= 3 && (head[0] & 0xFF) == 0xFF && (head[1] & 0xFF) == 0xD8 && (head[2] & 0xFF) == 0xFF) {
+            return true;
+        }
+        // PNG: 89 50 4E 47
+        if (length >= 8 && (head[0] & 0xFF) == 0x89 && head[1] == 'P' && head[2] == 'N' && head[3] == 'G') {
+            return true;
+        }
+        // GIF: GIF8
+        if (length >= 6 && head[0] == 'G' && head[1] == 'I' && head[2] == 'F' && head[3] == '8') {
+            return true;
+        }
+        // BMP: BM
+        if (length >= 2 && head[0] == 'B' && head[1] == 'M') {
+            return true;
+        }
+        // WebP: RIFF .... WEBP
+        return length >= 12 && head[0] == 'R' && head[1] == 'I' && head[2] == 'F' && head[3] == 'F'
+                && head[8] == 'W' && head[9] == 'E' && head[10] == 'B' && head[11] == 'P';
     }
 
     /**

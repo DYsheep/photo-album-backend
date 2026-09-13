@@ -40,6 +40,8 @@ jwt:
 file:
   upload-dir: ${java.io.tmpdir}/photo-test-uploads/
   access-url-prefix: /files/
+  # 测试用单文件上限，与 multipart 上限保持一致
+  max-size-mb: 10
 
 # 日志
 logging:

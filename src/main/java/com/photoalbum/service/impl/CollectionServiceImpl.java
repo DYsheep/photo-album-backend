@@ -9,22 +9,21 @@ import com.photoalbum.entity.Photo;
 import com.photoalbum.entity.PhotoCollection;
 import com.photoalbum.entity.PhotoCollectionPhoto;
 import com.photoalbum.entity.User;
-import com.photoalbum.entity.UserPermission;
 import com.photoalbum.mapper.CategoryMapper;
 import com.photoalbum.mapper.PhotoCollectionMapper;
 import com.photoalbum.mapper.PhotoCollectionPhotoMapper;
 import com.photoalbum.mapper.PhotoMapper;
-import com.photoalbum.mapper.UserPermissionMapper;
+import com.photoalbum.security.AccessPolicy;
+import com.photoalbum.security.CurrentUserSupport;
 import com.photoalbum.service.CollectionService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
-import org.springframework.security.core.Authentication;
-import org.springframework.security.core.context.SecurityContextHolder;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.time.LocalDateTime;
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -39,69 +38,37 @@ public class CollectionServiceImpl implements CollectionService {
     private final PhotoCollectionPhotoMapper collectionPhotoMapper;
     private final PhotoMapper photoMapper;
     private final CategoryMapper categoryMapper;
-    private final UserPermissionMapper permMapper;
+    private final AccessPolicy accessPolicy;
 
     @Value("${file.access-url-prefix}")
     private String accessUrlPrefix;
 
-    private boolean isAdmin() {
-        User user = getCurrentUser();
-        return user != null && "admin".equals(user.getRole());
-    }
-
-    private boolean canViewPrivate() {
-        User user = getCurrentUser();
-        return user != null && ("admin".equals(user.getRole()) || "viewer".equals(user.getRole()));
-    }
-
-    private void applyCollectionPermission(LambdaQueryWrapper<PhotoCollection> wrapper) {
-        if (!canViewPrivate()) { wrapper.eq(PhotoCollection::getIsPrivate, 0); return; }
-        if (isAdmin()) return;
-        User user = getCurrentUser();
-        if (user == null) return;
-        List<UserPermission> perms = permMapper.selectList(
-            new LambdaQueryWrapper<UserPermission>().eq(UserPermission::getUserId, user.getId())
-                .eq(UserPermission::getTargetType, "collection"));
-        if (perms.isEmpty()) return;
-        List<Long> whitelist = perms.stream().filter(p -> "W".equals(p.getPermType()))
-                .map(UserPermission::getTargetId).collect(Collectors.toList());
-        List<Long> blacklist = perms.stream().filter(p -> "B".equals(p.getPermType()))
-                .map(UserPermission::getTargetId).collect(Collectors.toList());
-        if (!whitelist.isEmpty()) {
-            wrapper.and(w -> w.eq(PhotoCollection::getIsPrivate, 0).or().in(PhotoCollection::getId, whitelist));
-        } else if (!blacklist.isEmpty()) {
-            wrapper.and(w -> w.eq(PhotoCollection::getIsPrivate, 0)
-                .or(w2 -> w2.eq(PhotoCollection::getIsPrivate, 1).notIn(PhotoCollection::getId, blacklist)));
-        }
-    }
-
-    /** 检查某张照片是否被当前 viewer 的黑白名单阻止 */
-    private boolean isPhotoBlockedByPermission(Long photoId) {
-        User user = getCurrentUser();
-        if (user == null) return false;
-        List<UserPermission> perms = permMapper.selectList(
-            new LambdaQueryWrapper<UserPermission>().eq(UserPermission::getUserId, user.getId())
-                .eq(UserPermission::getTargetType, "photo"));
-        boolean hasWhitelist = perms.stream().anyMatch(p -> "W".equals(p.getPermType()));
-        if (hasWhitelist) {
-            return perms.stream().noneMatch(p -> "W".equals(p.getPermType()) && p.getTargetId().equals(photoId));
-        }
-        return perms.stream().anyMatch(p -> "B".equals(p.getPermType()) && p.getTargetId().equals(photoId));
-    }
-
     private User getCurrentUser() {
-        Authentication auth = SecurityContextHolder.getContext().getAuthentication();
-        if (auth == null || !auth.isAuthenticated()) return null;
-        Object principal = auth.getPrincipal();
-        if (principal instanceof User) return (User) principal;
-        return null;
+        return CurrentUserSupport.getCurrentUser();
+    }
+
+    /**
+     * 校验合集是否可被当前调用者访问，不可访问按"不存在"处理（不暴露存在性）
+     * 未发布草稿与无权访问的私密合集对访客一律 404；具备管理权限的账号（后台）可见。
+     */
+    private PhotoCollection requireAccessibleCollection(Long collectionId) {
+        PhotoCollection collection = collectionMapper.selectById(collectionId);
+        if (!accessPolicy.canAccessCollection(getCurrentUser(), collection)) {
+            throw new BusinessException(404, "合集不存在");
+        }
+        return collection;
+    }
+
+    /** 照片是否对当前调用者可见（可见性统一由 AccessPolicy 判定） */
+    private boolean canView(Photo photo) {
+        return accessPolicy.canViewPhoto(getCurrentUser(), photo);
     }
 
     @Override
     public List<CollectionDTO> getPublishedCollections() {
         LambdaQueryWrapper<PhotoCollection> wrapper = new LambdaQueryWrapper<>();
         wrapper.eq(PhotoCollection::getIsPublished, 1);
-        applyCollectionPermission(wrapper);
+        accessPolicy.applyCollectionFilter(wrapper, getCurrentUser());
         wrapper.orderByAsc(PhotoCollection::getSortOrder)
                 .orderByDesc(PhotoCollection::getCreatedAt);
 
@@ -111,10 +78,7 @@ public class CollectionServiceImpl implements CollectionService {
 
     @Override
     public CollectionDTO getCollectionDetail(Long id) {
-        PhotoCollection collection = collectionMapper.selectById(id);
-        if (collection == null) {
-            throw new BusinessException("合集不存在");
-        }
+        PhotoCollection collection = requireAccessibleCollection(id);
         CollectionDTO dto = toDTO(collection);
         dto.setPhotos(getCollectionPhotos(id));
         return dto;
@@ -122,18 +86,22 @@ public class CollectionServiceImpl implements CollectionService {
 
     @Override
     public List<PhotoDTO> getCollectionPhotos(Long collectionId) {
+        // 合集自身不可访问时直接 404，避免未发布/私密合集内照片被枚举读取
+        requireAccessibleCollection(collectionId);
+
         LambdaQueryWrapper<PhotoCollectionPhoto> wrapper = new LambdaQueryWrapper<>();
         wrapper.eq(PhotoCollectionPhoto::getCollectionId, collectionId)
                 .orderByAsc(PhotoCollectionPhoto::getSortOrder);
 
         List<PhotoCollectionPhoto> relations = collectionPhotoMapper.selectList(wrapper);
-        return relations.stream().map(rel -> {
+        List<PhotoDTO> result = new ArrayList<>();
+        for (PhotoCollectionPhoto rel : relations) {
             Photo photo = photoMapper.selectById(rel.getPhotoId());
-            if (photo == null) return null;
-            if (!canViewPrivate() && photo.getIsPrivate() != null && photo.getIsPrivate() == 1) return null;
-            if (canViewPrivate() && !isAdmin() && isPhotoBlockedByPermission(photo.getId())) return null;
-            return toPhotoDTO(photo);
-        }).filter(dto -> dto != null).collect(Collectors.toList());
+            if (photo != null && canView(photo)) {
+                result.add(toPhotoDTO(photo));
+            }
+        }
+        return result;
     }
 
     @Override
@@ -161,6 +129,9 @@ public class CollectionServiceImpl implements CollectionService {
     @Override
     public Map<String, Object> getAdjacentInCollection(Long collectionId, Long photoId) {
         Map<String, Object> result = new HashMap<>();
+        // 合集不可访问时直接拒绝，避免通过相邻关系探测未发布/私密合集的内容
+        requireAccessibleCollection(collectionId);
+
         // 查合集内所有照片排序
         LambdaQueryWrapper<PhotoCollectionPhoto> wp = new LambdaQueryWrapper<>();
         wp.eq(PhotoCollectionPhoto::getCollectionId, collectionId)

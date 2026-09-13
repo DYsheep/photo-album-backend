@@ -5,13 +5,20 @@ import com.photoalbum.common.Result;
 import com.photoalbum.entity.User;
 import com.photoalbum.service.UserService;
 import lombok.RequiredArgsConstructor;
+import org.springframework.security.access.prepost.PreAuthorize;
 import org.springframework.web.bind.annotation.*;
 
 import java.util.*;
 
+/**
+ * 用户与授权管理（仅管理员：user:manage）
+ *
+ * 路径级规则（/api/admin/users/**）与方法级注解双重约束，避免路径调整后失去保护。
+ */
 @RestController
 @RequestMapping("/api/admin/users")
 @RequiredArgsConstructor
+@PreAuthorize("hasAuthority('user:manage')")
 public class AdminUserController {
 
     private final UserService userService;
@@ -86,9 +93,13 @@ public class AdminUserController {
     /** 添加权限条目 */
     @PostMapping("/{id}/permissions")
     public Result<Void> addPermission(@PathVariable Long id, @RequestBody Map<String, String> body) {
-        userService.addPermission(id, body.get("permType"), body.get("targetType"),
-                Long.valueOf(body.get("targetId")));
-        return Result.ok();
+        try {
+            userService.addPermission(id, body.get("permType"), body.get("targetType"),
+                    parseLongOrNull(body.get("targetId")));
+            return Result.ok();
+        } catch (BusinessException e) {
+            return Result.fail(e.getCode(), e.getMessage());
+        }
     }
 
     /** 删除权限条目 */
@@ -101,5 +112,10 @@ public class AdminUserController {
     private Integer parseIntOrNull(String s) {
         if (s == null || s.isBlank()) return null;
         try { return Integer.parseInt(s.trim()); } catch (NumberFormatException e) { return null; }
+    }
+
+    private Long parseLongOrNull(String s) {
+        if (s == null || s.isBlank()) return null;
+        try { return Long.valueOf(s.trim()); } catch (NumberFormatException e) { return null; }
     }
 }

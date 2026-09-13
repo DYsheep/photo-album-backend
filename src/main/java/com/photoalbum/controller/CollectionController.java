@@ -3,11 +3,9 @@ package com.photoalbum.controller;
 import com.photoalbum.common.Result;
 import com.photoalbum.dto.CollectionDTO;
 import com.photoalbum.dto.PhotoDTO;
-import com.photoalbum.entity.User;
 import com.photoalbum.service.CollectionService;
 import lombok.RequiredArgsConstructor;
-import org.springframework.security.core.Authentication;
-import org.springframework.security.core.context.SecurityContextHolder;
+import org.springframework.security.access.prepost.PreAuthorize;
 import org.springframework.web.bind.annotation.*;
 
 import java.util.List;
@@ -15,6 +13,8 @@ import java.util.Map;
 
 /**
  * 合集管理控制器
+ *
+ * 读取接口公开（可见性由 AccessPolicy 统一过滤）；后台写接口统一要求管理权限（photo:manage）。
  */
 @RestController
 @RequiredArgsConstructor
@@ -57,93 +57,72 @@ public class CollectionController {
     }
 
     /**
-     * 创建合集
+     * 创建合集（需管理权限）
      * POST /api/admin/collections
      */
     @PostMapping("/api/admin/collections")
+    @PreAuthorize("hasAuthority('photo:manage')")
     public Result<CollectionDTO> create(@RequestBody CollectionDTO dto) {
-        try {
-            checkManagePermission();
-            CollectionDTO result = collectionService.createCollection(dto);
-            return Result.ok(result);
-        } catch (com.photoalbum.common.BusinessException e) {
-            return Result.fail(e.getCode(), e.getMessage());
-        }
+        CollectionDTO result = collectionService.createCollection(dto);
+        return Result.ok(result);
     }
 
     /**
-     * 更新合集
+     * 更新合集（需管理权限）
      * PUT /api/admin/collections/{id}
      */
     @PutMapping("/api/admin/collections/{id}")
+    @PreAuthorize("hasAuthority('photo:manage')")
     public Result<CollectionDTO> update(@PathVariable Long id, @RequestBody CollectionDTO dto) {
-        try {
-            checkManagePermission();
-            CollectionDTO result = collectionService.updateCollection(id, dto);
-            return Result.ok(result);
-        } catch (com.photoalbum.common.BusinessException e) {
-            return Result.fail(e.getCode(), e.getMessage());
-        }
+        CollectionDTO result = collectionService.updateCollection(id, dto);
+        return Result.ok(result);
     }
 
     /**
-     * 删除合集
+     * 删除合集（需管理权限）
      * DELETE /api/admin/collections/{id}
      */
     @DeleteMapping("/api/admin/collections/{id}")
+    @PreAuthorize("hasAuthority('photo:manage')")
     public Result<Void> delete(@PathVariable Long id) {
-        try {
-            checkManagePermission();
-            collectionService.deleteCollection(id);
-            return Result.ok();
-        } catch (com.photoalbum.common.BusinessException e) {
-            return Result.fail(e.getCode(), e.getMessage());
-        }
+        collectionService.deleteCollection(id);
+        return Result.ok();
     }
 
     /**
-     * 向合集添加照片
+     * 向合集添加照片（需管理权限）
      * POST /api/admin/collections/{id}/photos/{photoId}
      */
     @PostMapping("/api/admin/collections/{id}/photos/{photoId}")
+    @PreAuthorize("hasAuthority('photo:manage')")
     public Result<Void> addPhoto(@PathVariable("id") Long collectionId,
                                   @PathVariable Long photoId) {
-        try {
-            collectionService.addPhoto(collectionId, photoId);
-            return Result.ok();
-        } catch (com.photoalbum.common.BusinessException e) {
-            return Result.fail(e.getCode(), e.getMessage());
-        }
+        collectionService.addPhoto(collectionId, photoId);
+        return Result.ok();
     }
 
     /**
-     * 从合集移除照片
+     * 从合集移除照片（需管理权限）
      * DELETE /api/admin/collections/{id}/photos/{photoId}
      */
     @DeleteMapping("/api/admin/collections/{id}/photos/{photoId}")
+    @PreAuthorize("hasAuthority('photo:manage')")
     public Result<Void> removePhoto(@PathVariable("id") Long collectionId,
                                      @PathVariable Long photoId) {
-        try {
-            collectionService.removePhoto(collectionId, photoId);
-            return Result.ok();
-        } catch (com.photoalbum.common.BusinessException e) {
-            return Result.fail(e.getCode(), e.getMessage());
-        }
+        collectionService.removePhoto(collectionId, photoId);
+        return Result.ok();
     }
 
     /**
-     * 批量重排序合集
+     * 批量重排序合集（需管理权限）
      * PUT /api/admin/collections/reorder
      * Body: [{ id: 1, sortOrder: 0 }, { id: 3, sortOrder: 1 }, ...]
      */
     @PutMapping("/api/admin/collections/reorder")
+    @PreAuthorize("hasAuthority('photo:manage')")
     public Result<Void> reorder(@RequestBody List<Map<String, Object>> orderList) {
-        try {
-            collectionService.reorderCollections(orderList);
-            return Result.ok();
-        } catch (com.photoalbum.common.BusinessException e) {
-            return Result.fail(e.getCode(), e.getMessage());
-        }
+        collectionService.reorderCollections(orderList);
+        return Result.ok();
     }
 
     /**
@@ -155,19 +134,5 @@ public class CollectionController {
                                                  @RequestParam Long photoId) {
         Map<String, Object> result = collectionService.getAdjacentInCollection(id, photoId);
         return Result.ok(result);
-    }
-
-    private User getCurrentUser() {
-        Authentication auth = SecurityContextHolder.getContext().getAuthentication();
-        if (auth != null && auth.getPrincipal() instanceof User) return (User) auth.getPrincipal();
-        return null;
-    }
-    private boolean isAdmin() { User u = getCurrentUser(); return u != null && "admin".equals(u.getRole()); }
-    private void checkManagePermission() {
-        User u = getCurrentUser();
-        if (u == null) throw new RuntimeException("未登录");
-        if (isAdmin()) return;
-        if (u.getCanManage() == null || u.getCanManage() != 1)
-            throw new RuntimeException("无管理权限");
     }
 }

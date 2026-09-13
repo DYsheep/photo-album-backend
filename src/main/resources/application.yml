@@ -10,8 +10,9 @@ spring:
 
   servlet:
     multipart:
-      max-file-size: 500MB
-      max-request-size: 500MB
+      # 单文件/单请求上限，需与 file.max-size-mb 保持一致（应用内会再次校验）
+      max-file-size: 100MB
+      max-request-size: 110MB
 
 mybatis-plus:
   mapper-locations: classpath*:/mapper/**/*.xml
@@ -22,7 +23,11 @@ mybatis-plus:
 
 # JWT 配置
 jwt:
-  secret: ${JWT_SECRET:dev-only-secret-not-for-production-use}
+  # 安全要求：此处不得设置默认密钥（默认值会随公开仓库泄露，可被用于伪造管理员令牌）。
+  # 生产环境必须通过环境变量 JWT_SECRET 注入不少于 32 个字符的随机值，例如：
+  #   JWT_SECRET=$(head -c 48 /dev/urandom | base64)
+  # 未注入时服务仍可启动，但每次启动会生成一次性随机密钥（重启后既有登录状态全部失效）。
+  secret: ${JWT_SECRET:}
   expiration: 86400000    # 24小时（毫秒）
   header: Authorization
 
@@ -30,6 +35,9 @@ jwt:
 file:
   upload-dir: C:/Develop/photo-data/uploads/
   access-url-prefix: /files/
+  # 单文件大小上限（MB），可通过环境变量 FILE_MAX_SIZE_MB 覆盖。
+  # 该值决定单次上传可占用的内存峰值（上传时整文件读入内存），不建议超过 100。
+  max-size-mb: 100
 
 # 腾讯云 COS
 cos:
@@ -42,6 +50,16 @@ cos:
 # 分享链接配置（生产环境通过环境变量 SHARE_BASE_URL 覆盖）
 share:
   base-url: https://www.dyframe.art
+
+# 应用安全相关配置
+app:
+  cors:
+    # 允许跨域访问的来源白名单（逗号分隔），不使用通配符
+    allowed-origins: https://www.dyframe.art,https://dyframe.art,http://localhost:5173,http://127.0.0.1:5173
+  security:
+    # 部署在 Nginx 反向代理之后时为 true：登录限流按 X-Forwarded-For 最右侧地址取值
+    # （最左侧为客户可伪造字段）。服务直接对外暴露时请设为 false。
+    trust-proxy: true
 
 # 日志级别
 logging:

@@ -36,6 +36,25 @@ public class GlobalExceptionHandler {
     }
 
     /**
+     * 权限不足（方法级 @PreAuthorize 拒绝时抛出）
+     * 统一转换为业务响应体，避免前端拿到 Spring Security 的默认错误页
+     */
+    @ExceptionHandler(org.springframework.security.access.AccessDeniedException.class)
+    public Result<Void> handleAccessDenied(org.springframework.security.access.AccessDeniedException e) {
+        log.warn("访问被拒绝: {}", e.getMessage());
+        return Result.fail(403, "无权限执行该操作");
+    }
+
+    /**
+     * 未认证（无登录态时方法级鉴权抛出）
+     */
+    @ExceptionHandler(org.springframework.security.core.AuthenticationException.class)
+    public Result<Void> handleAuthenticationException(org.springframework.security.core.AuthenticationException e) {
+        log.debug("未认证访问: {}", e.getMessage());
+        return Result.fail(401, "未登录");
+    }
+
+    /**
      * 业务异常（自定义 BusinessException）
      */
     @ExceptionHandler(BusinessException.class)

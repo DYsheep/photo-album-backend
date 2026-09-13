@@ -7,7 +7,12 @@ import com.photoalbum.dto.PhotoDTO;
 import com.photoalbum.entity.Category;
 import com.photoalbum.entity.Photo;
 import com.photoalbum.mapper.CategoryMapper;
+import com.photoalbum.mapper.PhotoCollectionPhotoMapper;
 import com.photoalbum.mapper.PhotoMapper;
+import com.photoalbum.mapper.ShareLinkMapper;
+import com.photoalbum.mapper.UserPermissionMapper;
+import com.photoalbum.security.AccessPolicy;
+import com.qcloud.cos.COSClient;
 import org.junit.jupiter.api.*;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.*;
@@ -40,16 +45,48 @@ class PhotoServiceTest {
     @Mock
     private CategoryMapper categoryMapper;
 
+    /** deletePhoto/batchDelete 会级联清理合集关联与分享链接，需一并 mock */
+    @Mock
+    private PhotoCollectionPhotoMapper collectionPhotoMapper;
+
+    @Mock
+    private ShareLinkMapper shareLinkMapper;
+
+    @Mock
+    private UserPermissionMapper permMapper;
+
+    /** 可见性策略由 AccessPolicyTest 单独覆盖，此处仅需注入以保证调用链完整 */
+    @Mock
+    private AccessPolicy accessPolicy;
+
+    /** 对象存储客户端为外部依赖，单元测试中必须 mock（否则上传路径会因空指针失败） */
+    @Mock
+    private COSClient cosClient;
+
     @InjectMocks
     private PhotoServiceImpl photoService;
 
     private Path tempUploadDir;
 
+    // 测试用真实图片文件头（魔数），用于通过上传内容校验
+    private static final byte[] JPEG_MAGIC = {(byte) 0xFF, (byte) 0xD8, (byte) 0xFF, (byte) 0xE0};
+    private static final byte[] PNG_MAGIC = {(byte) 0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A};
+    private static final byte[] GIF_MAGIC = {'G', 'I', 'F', '8', '9', 'a'};
+    private static final byte[] BMP_MAGIC = {'B', 'M'};
+    private static final byte[] WEBP_MAGIC = {
+            'R', 'I', 'F', 'F', 0x00, 0x00, 0x00, 0x00, 'W', 'E', 'B', 'P'};
+
+    /** 生成指定总长度、带真实文件头的图片字节 */
+    private static byte[] imageBytes(byte[] magic, int totalSize) {
+        byte[] data = new byte[totalSize];
+        System.arraycopy(magic, 0, data, 0, Math.min(magic.length, totalSize));
+        return data;
+    }
+
     @BeforeEach
     void setUp() throws IOException {
-        // 创建临时上传目录
+        // 创建临时上传目录（供用例自身清理使用）
         tempUploadDir = Files.createTempDirectory("photo-test-upload-");
-        ReflectionTestUtils.setField(photoService, "uploadDir", tempUploadDir.toString());
         ReflectionTestUtils.setField(photoService, "accessUrlPrefix", "/files/");
     }
 
@@ -79,7 +116,7 @@ class PhotoServiceTest {
             // Arrange
             MockMultipartFile file = new MockMultipartFile(
                     "file", "test-photo.jpg", "image/jpeg",
-                    new byte[1024] // 1KB
+                    imageBytes(JPEG_MAGIC, 1024) // 1KB（含真实 JPEG 文件头）
             );
 
             // 使用 ArgumentCaptor 捕获 insert 的 Photo 以验证结构化字段
@@ -119,7 +156,7 @@ class PhotoServiceTest {
             // Arrange
             MockMultipartFile file = new MockMultipartFile(
                     "file", "screenshot.png", "image/png",
-                    new byte[512]
+                    imageBytes(PNG_MAGIC, 512)
             );
             when(photoMapper.insert(any(Photo.class))).thenReturn(1);
 
@@ -139,7 +176,7 @@ class PhotoServiceTest {
         @DisplayName("上传 WEBP 图片，应成功")
         void shouldUploadWebpSuccessfully() throws Exception {
             MockMultipartFile file = new MockMultipartFile(
-                    "file", "animated.webp", "image/webp", new byte[2048]
+                    "file", "animated.webp", "image/webp", imageBytes(WEBP_MAGIC, 2048)
             );
             when(photoMapper.insert(any(Photo.class))).thenReturn(1);
 
@@ -212,10 +249,26 @@ class PhotoServiceTest {
         }
 
         @Test
+        @DisplayName("上传伪装成图片的网页文件（扩展名为 jpg、内容为 HTML），应抛出 BusinessException")
+        void shouldRejectDisguisedHtmlFile() {
+            MockMultipartFile file = new MockMultipartFile(
+                    "file", "fake.jpg", "image/jpeg",
+                    "<html><script>alert(1)</script></html>".getBytes(java.nio.charset.StandardCharsets.UTF_8)
+            );
+
+            BusinessException ex = assertThrows(BusinessException.class, () ->
+                    photoService.upload(file, null, null, null, null, null, null)
+            );
+
+            assertThat(ex.getMessage()).contains("不是有效的图片");
+            verify(photoMapper, never()).insert(any());
+        }
+
+        @Test
         @DisplayName("上传 GIF 格式，应成功")
         void shouldUploadGifSuccessfully() throws Exception {
             MockMultipartFile file = new MockMultipartFile(
-                    "file", "animation.gif", "image/gif", new byte[512]
+                    "file", "animation.gif", "image/gif", imageBytes(GIF_MAGIC, 512)
             );
             when(photoMapper.insert(any(Photo.class))).thenReturn(1);
 
@@ -230,7 +283,7 @@ class PhotoServiceTest {
         @DisplayName("上传 BMP 格式，应成功")
         void shouldUploadBmpSuccessfully() throws Exception {
             MockMultipartFile file = new MockMultipartFile(
-                    "file", "bitmap.bmp", "image/bmp", new byte[256]
+                    "file", "bitmap.bmp", "image/bmp", imageBytes(BMP_MAGIC, 256)
             );
             when(photoMapper.insert(any(Photo.class))).thenReturn(1);
 
@@ -244,7 +297,7 @@ class PhotoServiceTest {
         @DisplayName("上传时 categoryId 关联有效分类，DTO 中应有分类名称")
         void shouldFillCategoryNameInDto() throws Exception {
             MockMultipartFile file = new MockMultipartFile(
-                    "file", "photo.jpg", "image/jpeg", new byte[1024]
+                    "file", "photo.jpg", "image/jpeg", imageBytes(JPEG_MAGIC, 1024)
             );
             Category cat = new Category();
             cat.setId(1L);
@@ -616,7 +669,8 @@ class PhotoServiceTest {
             p2.setId(2L);
             p2.setTags("日出");
 
-            when(photoMapper.selectList(isNull())).thenReturn(Arrays.asList(p1, p2));
+            // getTagList 会拼接可见性过滤条件，因此传入的是 LambdaQueryWrapper 而非 null
+            when(photoMapper.selectList(any(LambdaQueryWrapper.class))).thenReturn(Arrays.asList(p1, p2));
 
             // Act
             List<Map<String, Object>> result = photoService.getTagList();
@@ -632,7 +686,7 @@ class PhotoServiceTest {
         @Test
         @DisplayName("无标签数据时，应返回空列表")
         void shouldReturnEmptyListWhenNoTags() {
-            when(photoMapper.selectList(isNull())).thenReturn(Collections.emptyList());
+            when(photoMapper.selectList(any(LambdaQueryWrapper.class))).thenReturn(Collections.emptyList());
 
             List<Map<String, Object>> result = photoService.getTagList();
 
@@ -652,7 +706,7 @@ class PhotoServiceTest {
             p3.setId(3L);
             p3.setTags(null);        // null，应跳过
 
-            when(photoMapper.selectList(isNull())).thenReturn(Arrays.asList(p1, p2, p3));
+            when(photoMapper.selectList(any(LambdaQueryWrapper.class))).thenReturn(Arrays.asList(p1, p2, p3));
 
             List<Map<String, Object>> result = photoService.getTagList();
 
@@ -798,11 +852,11 @@ class PhotoServiceTest {
             assertTrue(exifStats.containsKey("isos"));
             assertTrue(exifStats.containsKey("yearDistribution"));
 
-            // 验证相机型号分布
+            // 验证相机型号分布（服务端做归一化：去空格并统一大写）
             @SuppressWarnings("unchecked")
             Map<String, Long> cameras = (Map<String, Long>) exifStats.get("cameras");
             assertEquals(1, cameras.size());
-            assertEquals(2L, cameras.get("Canon EOS R5"));
+            assertEquals(2L, cameras.get("CANON EOS R5"));
 
             // 验证焦段分布
             @SuppressWarnings("unchecked")

@@ -212,12 +212,14 @@ class AuthControllerTest {
         }
 
         @Test
-        @DisplayName("未认证请求，应返回 500（NPE — Controller 未做 null 检查）")
+        @DisplayName("未认证请求，应返回 401（未登录）")
         void shouldFailWhenNotAuthenticated() throws Exception {
             SecurityContextHolder.clearContext();
 
             mockMvc.perform(get("/api/auth/userinfo"))
-                    .andExpect(status().is5xxServerError());
+                    .andExpect(status().isOk())
+                    .andExpect(jsonPath("$.code").value(401))
+                    .andExpect(jsonPath("$.message").value("未登录"));
         }
     }
 

@@ -5,6 +5,7 @@ import com.photoalbum.entity.Photo;
 import com.photoalbum.mapper.PhotoMapper;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.security.access.prepost.PreAuthorize;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.web.bind.annotation.*;
 
@@ -12,12 +13,13 @@ import java.util.*;
 import java.util.stream.Collectors;
 
 /**
- * 标签管理控制器（需要认证）
+ * 标签管理控制器（需管理权限：photo:manage）
  */
 @Slf4j
 @RestController
 @RequestMapping("/api/admin/tags")
 @RequiredArgsConstructor
+@PreAuthorize("hasAuthority('photo:manage')")
 public class TagController {
 
     private final PhotoMapper photoMapper;

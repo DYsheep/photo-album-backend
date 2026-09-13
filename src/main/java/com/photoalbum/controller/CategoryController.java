@@ -10,6 +10,7 @@ import com.photoalbum.mapper.PhotoMapper;
 import com.photoalbum.service.CategoryService;
 import jakarta.validation.Valid;
 import lombok.RequiredArgsConstructor;
+import org.springframework.security.access.prepost.PreAuthorize;
 import org.springframework.web.bind.annotation.*;
 
 import java.time.LocalDateTime;
@@ -17,6 +18,9 @@ import java.util.List;
 
 /**
  * 分类管理控制器
+ *
+ * 分类属于内容管理范畴：读取公开，增删改需具备管理权限（photo:manage）。
+ * 此前写接口未做任何权限校验，任何已登录账号均可增删改分类。
  */
 @RestController
 @RequestMapping("/api/categories")
@@ -38,9 +42,10 @@ public class CategoryController {
     }
 
     /**
-     * 新建分类
+     * 新建分类（需管理权限）
      */
     @PostMapping
+    @PreAuthorize("hasAuthority('photo:manage')")
     public Result<Category> create(@Valid @RequestBody CategoryDTO dto) {
         // 检查名称是否重复
         long count = categoryService.count(
@@ -62,9 +67,10 @@ public class CategoryController {
     }
 
     /**
-     * 修改分类
+     * 修改分类（需管理权限）
      */
     @PutMapping("/{id}")
+    @PreAuthorize("hasAuthority('photo:manage')")
     public Result<Category> update(@PathVariable Long id, @Valid @RequestBody CategoryDTO dto) {
         Category category = categoryService.getById(id);
         if (category == null) {
@@ -95,9 +101,10 @@ public class CategoryController {
     }
 
     /**
-     * 删除分类（有照片关联时保护）
+     * 删除分类（有照片关联时保护，需管理权限）
      */
     @DeleteMapping("/{id}")
+    @PreAuthorize("hasAuthority('photo:manage')")
     public Result<Void> delete(@PathVariable Long id) {
         Category category = categoryService.getById(id);
         if (category == null) {
