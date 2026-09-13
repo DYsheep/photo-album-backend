@@ -12,6 +12,8 @@ import com.photoalbum.mapper.PhotoMapper;
 import com.photoalbum.mapper.ShareLinkMapper;
 import com.photoalbum.mapper.UserPermissionMapper;
 import com.photoalbum.security.AccessPolicy;
+import com.photoalbum.service.PhotoUrlResolver;
+import com.photoalbum.service.TagService;
 import com.qcloud.cos.COSClient;
 import org.junit.jupiter.api.*;
 import org.junit.jupiter.api.extension.ExtendWith;
@@ -59,6 +61,10 @@ class PhotoServiceTest {
     @Mock
     private AccessPolicy accessPolicy;
 
+    /** 标签关联表同步（写路径双写），单测中为无操作 */
+    @Mock
+    private TagService tagService;
+
     /** 对象存储客户端为外部依赖，单元测试中必须 mock（否则上传路径会因空指针失败） */
     @Mock
     private COSClient cosClient;
@@ -88,6 +94,14 @@ class PhotoServiceTest {
         // 创建临时上传目录（供用例自身清理使用）
         tempUploadDir = Files.createTempDirectory("photo-test-upload-");
         ReflectionTestUtils.setField(photoService, "accessUrlPrefix", "/files/");
+        // 注入真实的地址解析器（内部只做字符串与签名处理，不发网络请求）
+        PhotoUrlResolver urlResolver = new PhotoUrlResolver(cosClient);
+        ReflectionTestUtils.setField(urlResolver, "cosBucket", "test-bucket");
+        ReflectionTestUtils.setField(urlResolver, "cosDomain", "https://cos.example.com");
+        ReflectionTestUtils.setField(urlResolver, "accessUrlPrefix", "/files/");
+        ReflectionTestUtils.setField(urlResolver, "presignedTtlMinutes", 60L);
+        ReflectionTestUtils.setField(urlResolver, "privateAclEnabled", false);
+        ReflectionTestUtils.setField(photoService, "photoUrlResolver", urlResolver);
     }
 
     @AfterEach

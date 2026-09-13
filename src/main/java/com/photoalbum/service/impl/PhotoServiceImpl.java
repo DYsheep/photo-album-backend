@@ -1,6 +1,7 @@
 package com.photoalbum.service.impl;
 
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
+import com.baomidou.mybatisplus.core.conditions.update.LambdaUpdateWrapper;
 import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
 import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
 import com.photoalbum.common.BusinessException;
@@ -18,6 +19,8 @@ import com.photoalbum.mapper.ShareLinkMapper;
 import com.photoalbum.security.AccessPolicy;
 import com.photoalbum.security.CurrentUserSupport;
 import com.photoalbum.service.PhotoService;
+import com.photoalbum.service.PhotoUrlResolver;
+import com.photoalbum.service.TagService;
 import com.qcloud.cos.COSClient;
 import com.qcloud.cos.model.ObjectMetadata;
 import com.qcloud.cos.model.PutObjectRequest;
@@ -66,6 +69,8 @@ public class PhotoServiceImpl extends ServiceImpl<PhotoMapper, Photo> implements
     private final PhotoCollectionPhotoMapper collectionPhotoMapper;
     private final ShareLinkMapper shareLinkMapper;
     private final AccessPolicy accessPolicy;
+    private final PhotoUrlResolver photoUrlResolver;
+    private final TagService tagService;
     private final COSClient cosClient;
     private final ObjectMapper objectMapper = new ObjectMapper();
 
@@ -218,6 +223,13 @@ public class PhotoServiceImpl extends ServiceImpl<PhotoMapper, Photo> implements
 
         photoMapper.insert(photo);
 
+        // 标签关联表同步（展示字段与关联表双写，标签管理与标签级授权以关联表为准）
+        tagService.syncRelations(photo.getId(), photo.getTags());
+
+        // 私密照片：把对象 ACL 置为 private，使其直链不可被匿名访问
+        // （访问改为由接口签发短期预签名地址，见 PhotoUrlResolver）
+        applyPrivateAcl(photo);
+
         // 若指定了合集，自动加入
         if (collectionId != null) {
             PhotoCollectionPhoto rel = new PhotoCollectionPhoto();
@@ -286,10 +298,53 @@ public class PhotoServiceImpl extends ServiceImpl<PhotoMapper, Photo> implements
         if (dto.getDescription() != null) photo.setDescription(dto.getDescription());
         if (dto.getCategoryId() != null) photo.setCategoryId(dto.getCategoryId());
         if (dto.getTags() != null) photo.setTags(dto.getTags());
-        if (dto.getIsPrivate() != null && isAdmin()) photo.setIsPrivate(dto.getIsPrivate());
+        boolean privacyChanged = false;
+        if (dto.getIsPrivate() != null && isAdmin()) {
+            privacyChanged = !dto.getIsPrivate().equals(photo.getIsPrivate());
+            photo.setIsPrivate(dto.getIsPrivate());
+        }
         photo.setUpdatedAt(LocalDateTime.now());
 
         photoMapper.updateById(photo);
+
+        // 标签变更时同步关联表
+        if (dto.getTags() != null) {
+            tagService.syncRelations(photo.getId(), photo.getTags());
+        }
+
+        // 私密标记变化时同步对象 ACL（公开↔私密）
+        if (privacyChanged) {
+            applyPrivateAcl(photo);
+        }
+    }
+
+    /**
+     * 按照片的私密标记同步对象 ACL（私密=private，公开=public-read）
+     */
+    private void applyPrivateAcl(Photo photo) {
+        photoUrlResolver.applyObjectAcl(photo.getUrl(), photo.getIsPrivate());
+        photoUrlResolver.applyObjectAcl(photo.getThumbnailUrl(), photo.getIsPrivate());
+    }
+
+    /**
+     * 修复存量私密照片的对象 ACL（一次性维护动作）
+     *
+     * 历史私密照片的对象可能仍是公共读，执行后其直链将不可匿名访问，只能通过预签名地址访问。
+     *
+     * @return 已处理（尝试修复）的照片数量
+     */
+    @Override
+    public int repairPrivateAcl() {
+        if (!photoUrlResolver.isPrivateAclEnabled()) {
+            throw new BusinessException("当前未启用对象级私密 ACL（cos.private-acl-enabled=false）");
+        }
+        List<Photo> privatePhotos = photoMapper.selectList(
+                new LambdaQueryWrapper<Photo>().eq(Photo::getIsPrivate, 1));
+        for (Photo photo : privatePhotos) {
+            applyPrivateAcl(photo);
+        }
+        log.info("存量私密照片对象 ACL 修复完成: 共 {} 张", privatePhotos.size());
+        return privatePhotos.size();
     }
 
     /**
@@ -497,6 +552,8 @@ public class PhotoServiceImpl extends ServiceImpl<PhotoMapper, Photo> implements
             if (modified) {
                 photo.setUpdatedAt(LocalDateTime.now());
                 photoMapper.updateById(photo);
+                // 标签追加后同步关联表
+                tagService.syncRelations(photo.getId(), photo.getTags());
             }
         }
 
@@ -817,16 +874,32 @@ public class PhotoServiceImpl extends ServiceImpl<PhotoMapper, Photo> implements
 
     /**
      * 点赞照片，返回最新点赞数
+     *
+     * 使用 SQL 原子自增：此前的"读-改-写"在并发点赞时会丢更新。
      */
     public int likePhoto(Long id) {
+        photoMapper.update(null, new LambdaUpdateWrapper<Photo>()
+                .setSql("like_count = COALESCE(like_count, 0) + 1")
+                .eq(Photo::getId, id));
         Photo photo = photoMapper.selectById(id);
-        if (photo == null) throw new BusinessException("照片不存在");
-        int newCount = (photo.getLikeCount() == null ? 0 : photo.getLikeCount()) + 1;
-        Photo update = new Photo();
-        update.setId(id);
-        update.setLikeCount(newCount);
-        photoMapper.updateById(update);
-        return newCount;
+        if (photo == null) {
+            throw new BusinessException("照片不存在");
+        }
+        return photo.getLikeCount() == null ? 0 : photo.getLikeCount();
+    }
+
+    /**
+     * 浏览量 +1，返回最新浏览量
+     *
+     * 同样改为原子自增，避免并发访问时丢计数。
+     */
+    @Override
+    public int incrementViewCount(Long id) {
+        photoMapper.update(null, new LambdaUpdateWrapper<Photo>()
+                .setSql("view_count = COALESCE(view_count, 0) + 1")
+                .eq(Photo::getId, id));
+        Photo photo = photoMapper.selectById(id);
+        return photo != null && photo.getViewCount() != null ? photo.getViewCount() : 0;
     }
 
     /**
@@ -838,12 +911,9 @@ public class PhotoServiceImpl extends ServiceImpl<PhotoMapper, Photo> implements
         dto.setTitle(photo.getTitle());
         dto.setDescription(photo.getDescription());
         dto.setCategoryId(photo.getCategoryId());
-        // COS 已含完整域名，本地路径需拼接前缀
-        String url = photo.getUrl();
-        dto.setUrl(url != null && url.startsWith("http") ? url : accessUrlPrefix + url);
-        String thumbUrl = photo.getThumbnailUrl();
-        dto.setThumbnailUrl(thumbUrl != null && !thumbUrl.isEmpty()
-                ? (thumbUrl.startsWith("http") ? thumbUrl : accessUrlPrefix + thumbUrl) : null);
+        // 公开照片返回直链；私密照片返回短期预签名地址（对象 ACL 已置为私有）
+        dto.setUrl(photoUrlResolver.resolve(photo.getUrl(), photo.getIsPrivate()));
+        dto.setThumbnailUrl(photoUrlResolver.resolveThumbnail(photo.getThumbnailUrl(), photo.getIsPrivate()));
         dto.setFileName(photo.getFileName());
         dto.setFileSize(photo.getFileSize());
         dto.setTags(photo.getTags());

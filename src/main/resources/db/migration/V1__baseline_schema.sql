@@ -1,24 +1,27 @@
 -- ============================================
--- 摄影相册数据库初始化脚本
--- 数据库: photo_album
--- 说明: 本脚本仅包含结构定义与无口令的账号占位记录，
---       不包含任何默认口令或口令哈希（安全要求，见文件末尾说明）。
+-- V1 基线结构（全新部署由 Flyway 自动执行）
+--
+-- 说明：
+--   · 本文件是"结构 + 初始数据"的唯一来源，取代原先手工执行的 sql/init.sql；
+--   · 既有数据库首次接入 Flyway 时，会把当前状态记为基线 V1（不执行本文件），
+--     并用 sql/ 下的手工追平脚本补齐差异；此后所有结构变更新增 V2、V3…
 -- ============================================
 
-CREATE DATABASE IF NOT EXISTS photo_album DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
-USE photo_album;
-
 -- 用户表
+-- 权限模型：role 仅作标识，实际能力由能力位（can_upload / can_manage / can_view_private）决定；
+-- token_version 用于令牌吊销（改密、登出时自增，旧令牌立即失效）。
 CREATE TABLE IF NOT EXISTS t_user (
-    id          BIGINT       NOT NULL AUTO_INCREMENT COMMENT '主键',
-    username    VARCHAR(50)  NOT NULL UNIQUE  COMMENT '用户名',
-    password    VARCHAR(100) NOT NULL         COMMENT 'BCrypt加密密码',
-    nickname    VARCHAR(50)  DEFAULT ''       COMMENT '昵称',
-    avatar      VARCHAR(255) DEFAULT ''       COMMENT '头像URL',
-    role        VARCHAR(20)  DEFAULT 'user'   COMMENT '角色: admin/viewer/user',
-    can_upload  TINYINT      DEFAULT 0        COMMENT '上传权限: 0=无 1=有',
-    can_manage  TINYINT      DEFAULT 0        COMMENT '管理权限: 0=无 1=有',
-    created_at  DATETIME     DEFAULT CURRENT_TIMESTAMP,
+    id               BIGINT       NOT NULL AUTO_INCREMENT COMMENT '主键',
+    username         VARCHAR(50)  NOT NULL UNIQUE  COMMENT '用户名',
+    password         VARCHAR(100) NOT NULL         COMMENT 'BCrypt加密密码',
+    nickname         VARCHAR(50)  DEFAULT ''       COMMENT '昵称',
+    avatar           VARCHAR(255) DEFAULT ''       COMMENT '头像URL',
+    role             VARCHAR(20)  DEFAULT 'user'   COMMENT '角色标识: admin/viewer/user（仅作标识与展示）',
+    can_upload       TINYINT      DEFAULT 0        COMMENT '上传能力: 0=无 1=有',
+    can_manage       TINYINT      DEFAULT 0        COMMENT '管理能力: 0=无 1=有',
+    can_view_private TINYINT      DEFAULT 0        COMMENT '私密查看能力: 0=无 1=有（仍需 t_user_permission 逐项授权）',
+    token_version    INT          DEFAULT 0        COMMENT '令牌版本（改密/登出时自增以吊销旧令牌）',
+    created_at       DATETIME     DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='用户表';
 
@@ -35,6 +38,7 @@ CREATE TABLE IF NOT EXISTS t_category (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='分类表';
 
 -- 照片表
+-- tags 为逗号分隔的展示用冗余字段；标签的权威数据在 t_tag / t_photo_tag（支持重命名、合并与标签级授权）。
 CREATE TABLE IF NOT EXISTS t_photo (
     id            BIGINT       NOT NULL AUTO_INCREMENT COMMENT '主键',
     title         VARCHAR(100) NOT NULL           COMMENT '标题',
@@ -44,7 +48,7 @@ CREATE TABLE IF NOT EXISTS t_photo (
     thumbnail_url VARCHAR(500) DEFAULT NULL       COMMENT '缩略图存储路径',
     file_name     VARCHAR(200) DEFAULT ''         COMMENT '原始文件名',
     file_size     BIGINT       DEFAULT 0          COMMENT '文件大小(bytes)',
-    tags          VARCHAR(200) DEFAULT ''         COMMENT '标签(逗号分隔)',
+    tags          VARCHAR(200) DEFAULT ''         COMMENT '标签(逗号分隔，展示用冗余字段)',
     is_private    TINYINT      DEFAULT 0          COMMENT '是否私密: 0=公开 1=私密',
     view_count    INT          DEFAULT 0          COMMENT '浏览量',
     like_count    INT          DEFAULT 0          COMMENT '点赞数',
@@ -91,24 +95,40 @@ CREATE TABLE IF NOT EXISTS t_collection_photos (
     INDEX idx_photo (photo_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='合集照片关联表';
 
+-- 合集协作者表（对象级管理权：被指派的账号可维护该合集，而不具备全站管理权）
+CREATE TABLE IF NOT EXISTS t_collection_member (
+    id            BIGINT      NOT NULL AUTO_INCREMENT COMMENT '主键',
+    collection_id BIGINT      NOT NULL              COMMENT '合集ID',
+    user_id       BIGINT      NOT NULL              COMMENT '成员用户ID',
+    member_role   VARCHAR(20) DEFAULT 'editor'      COMMENT '成员角色: editor=可维护该合集',
+    created_by    BIGINT      DEFAULT NULL          COMMENT '指派操作人用户ID',
+    created_at    DATETIME    DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (id),
+    UNIQUE KEY uk_collection_user (collection_id, user_id),
+    INDEX idx_user (user_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='合集协作者表';
+
 -- 分享链接表
+-- expires_at 为 NULL 表示永久有效；到期后接口按"链接不存在或已失效"处理。
+-- 访问时还会动态校验照片当前可见性：照片为私密时，无权限访问者通过分享链接同样不可见。
 CREATE TABLE IF NOT EXISTS t_share_link (
     id         BIGINT      NOT NULL AUTO_INCREMENT COMMENT '主键',
     code       VARCHAR(32) NOT NULL UNIQUE         COMMENT '分享码',
     photo_id   BIGINT      NOT NULL                COMMENT '照片ID',
+    expires_at DATETIME    DEFAULT NULL            COMMENT '到期时间（NULL=永久有效）',
     created_at DATETIME    DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (id),
     INDEX idx_photo (photo_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='分享链接表';
 
--- 用户权限表（照片/合集级白名单与黑名单）
--- 默认拒绝模型：白名单（W）定义可见范围（global=全部私密），黑名单（B）在范围内排除；
--- 无任何白名单条目时看不到任何私密内容。
+-- 用户权限表（照片/合集/分类/标签级白名单与黑名单）
+-- 默认拒绝模型：白名单（W）定义可见范围（global=全部私密；collection/category/tag 级联到对应照片），
+-- 黑名单（B）在范围内排除；无任何白名单条目时看不到任何私密内容。
 CREATE TABLE IF NOT EXISTS t_user_permission (
     id          BIGINT      NOT NULL AUTO_INCREMENT COMMENT '主键',
     user_id     BIGINT      NOT NULL                COMMENT '用户ID',
     perm_type   CHAR(1)     NOT NULL                COMMENT 'W=白名单(定义可见范围) B=黑名单(在范围内排除)',
-    target_type VARCHAR(20) NOT NULL                COMMENT '授权对象类型: photo/collection/global',
+    target_type VARCHAR(20) NOT NULL                COMMENT '授权对象类型: photo/collection/category/tag/global',
     target_id   BIGINT      NOT NULL DEFAULT 0      COMMENT '授权对象ID（global 固定为 0）',
     created_at  DATETIME    DEFAULT CURRENT_TIMESTAMP COMMENT '授权时间',
     created_by  BIGINT      DEFAULT NULL            COMMENT '授权操作人用户ID（审计）',
@@ -116,8 +136,43 @@ CREATE TABLE IF NOT EXISTS t_user_permission (
     UNIQUE KEY uk_user_target (user_id, perm_type, target_type, target_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='用户权限表';
 
+-- 标签表（标签的权威数据）
+CREATE TABLE IF NOT EXISTS t_tag (
+    id         BIGINT      NOT NULL AUTO_INCREMENT COMMENT '主键',
+    name       VARCHAR(50) NOT NULL                COMMENT '标签名（唯一）',
+    created_at DATETIME    DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (id),
+    UNIQUE KEY uk_name (name)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='标签表';
+
+-- 照片-标签关联表（替代逗号分隔字符串做标签管理、统计与标签级授权）
+CREATE TABLE IF NOT EXISTS t_photo_tag (
+    id       BIGINT NOT NULL AUTO_INCREMENT COMMENT '主键',
+    photo_id BIGINT NOT NULL                COMMENT '照片ID',
+    tag_id   BIGINT NOT NULL                COMMENT '标签ID',
+    PRIMARY KEY (id),
+    UNIQUE KEY uk_photo_tag (photo_id, tag_id),
+    INDEX idx_tag (tag_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='照片标签关联表';
+
+-- 操作审计日志表（授权、账号与认证事件，只增不改）
+CREATE TABLE IF NOT EXISTS t_audit_log (
+    id          BIGINT       NOT NULL AUTO_INCREMENT COMMENT '主键',
+    actor_id    BIGINT       DEFAULT NULL      COMMENT '操作人用户ID（系统动作为 NULL）',
+    actor_name  VARCHAR(50)  DEFAULT ''        COMMENT '操作人用户名（冗余保存，便于追溯）',
+    action      VARCHAR(50)  NOT NULL          COMMENT '动作: GRANT_ADD/GRANT_REMOVE/USER_CREATE/USER_UPDATE/USER_DELETE/LOGIN_SUCCESS/LOGIN_FAIL',
+    target_type VARCHAR(30)  DEFAULT ''        COMMENT '对象类型: permission/user/auth',
+    target_id   BIGINT       DEFAULT NULL      COMMENT '对象ID',
+    detail      VARCHAR(500) DEFAULT ''        COMMENT '操作详情（不含敏感信息）',
+    ip          VARCHAR(45)  DEFAULT NULL      COMMENT '来源IP',
+    created_at  DATETIME     DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (id),
+    INDEX idx_created (created_at),
+    INDEX idx_actor (actor_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='操作审计日志表';
+
 -- ============================================
--- 初始化数据
+-- 初始数据
 -- ============================================
 
 -- 管理员账号占位记录（不含任何可用口令）
@@ -129,11 +184,11 @@ CREATE TABLE IF NOT EXISTS t_user_permission (
 --        · Python：python -c "import bcrypt,getpass;print(bcrypt.hashpw(getpass.getpass().encode(),bcrypt.gensalt(10)).decode())"
 --        · 或使用在线/离线 BCrypt 工具，cost 取 10
 --   2) 将生成的哈希写入库中：
---        UPDATE t_user SET password = '上一步生成的哈希', can_upload = 1, can_manage = 1
---         WHERE username = 'admin';
+--        UPDATE t_user SET password = '上一步生成的哈希', can_upload = 1, can_manage = 1,
+--               can_view_private = 1 WHERE username = 'admin';
 --   3) 首次登录后建议再次更换为独立强口令，并核对 t_user 表中不存在其他可登录账号。
-INSERT IGNORE INTO t_user (username, password, nickname, role, can_upload, can_manage) VALUES
-('admin', '__BCRYPT_HASH_REPLACE_ME__', '管理员', 'admin', 1, 1);
+INSERT IGNORE INTO t_user (username, password, nickname, role, can_upload, can_manage, can_view_private, token_version) VALUES
+('admin', '__BCRYPT_HASH_REPLACE_ME__', '管理员', 'admin', 1, 1, 1, 0);
 
 -- 默认分类
 INSERT INTO t_category (name, description, sort_order) VALUES

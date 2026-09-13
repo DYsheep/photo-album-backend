@@ -3,6 +3,7 @@ package com.photoalbum.service;
 import com.photoalbum.dto.ShareLinkDTO;
 import com.photoalbum.entity.ShareLink;
 
+import java.time.LocalDateTime;
 import java.util.List;
 
 /**
@@ -11,18 +12,24 @@ import java.util.List;
 public interface ShareService {
 
     /**
-     * 为照片创建分享链接
+     * 为照片创建（或复用并更新）分享链接
      *
-     * @param photoId 照片 ID
+     * 同一张照片只保留一条链接：已存在时按本次传入的有效期更新，不新增记录。
+     *
+     * @param photoId   照片 ID
+     * @param expiresAt 到期时间；传 null 表示永久有效
      * @return 包含完整 shareUrl 的 DTO
      */
-    ShareLinkDTO createShareLink(Long photoId);
+    ShareLinkDTO createShareLink(Long photoId, LocalDateTime expiresAt);
 
     /**
      * 根据分享码获取分享链接数据（含关联照片信息）
      *
+     * 校验顺序：分享码存在 → 未过期 → 照片存在 → 照片对当前调用者可见。
+     * 任一环节不通过均按"分享链接不存在或已失效"返回，不暴露具体情况。
+     *
      * @param code 8 位分享码
-     * @return 分享链接 DTO（含照片详细信息），不存在返回 null
+     * @return 分享链接 DTO（含照片详细信息）
      */
     ShareLinkDTO getByCode(String code);
 

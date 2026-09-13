@@ -65,4 +65,15 @@ public interface CollectionService {
 
     /** 获取合集内某张照片的相邻照片 ID */
     Map<String, Object> getAdjacentInCollection(Long collectionId, Long photoId);
+
+    // ========== 协作者（对象级管理权） ==========
+
+    /** 列出合集协作者（含用户名与昵称） */
+    List<Map<String, Object>> listMembers(Long collectionId);
+
+    /** 指派协作者（幂等） */
+    void addMember(Long collectionId, Long userId);
+
+    /** 移除协作者 */
+    void removeMember(Long collectionId, Long userId);
 }

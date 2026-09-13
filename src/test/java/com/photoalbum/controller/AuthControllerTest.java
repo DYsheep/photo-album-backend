@@ -72,7 +72,7 @@ class AuthControllerTest {
 
             when(userService.findByUsername("admin")).thenReturn(user);
             when(passwordEncoder.matches("admin123", user.getPassword())).thenReturn(true);
-            when(jwtUtil.generateToken("admin", 1L)).thenReturn(token);
+            when(jwtUtil.generateToken("admin", 1L, null)).thenReturn(token);
 
             mockMvc.perform(post("/api/auth/login")
                             .contentType(MediaType.APPLICATION_JSON)
@@ -88,7 +88,7 @@ class AuthControllerTest {
 
             verify(userService).findByUsername("admin");
             verify(passwordEncoder).matches("admin123", user.getPassword());
-            verify(jwtUtil).generateToken("admin", 1L);
+            verify(jwtUtil).generateToken("admin", 1L, null);
         }
 
         @Test
@@ -111,7 +111,7 @@ class AuthControllerTest {
                     .andExpect(jsonPath("$.message").value("用户名或密码错误"))
                     .andExpect(jsonPath("$.data").isEmpty());
 
-            verify(jwtUtil, never()).generateToken(anyString(), anyLong());
+            verify(jwtUtil, never()).generateToken(anyString(), anyLong(), any());
         }
 
         @Test
@@ -131,7 +131,7 @@ class AuthControllerTest {
                     .andExpect(jsonPath("$.message").value("用户名或密码错误"));
 
             verify(passwordEncoder, never()).matches(anyString(), anyString());
-            verify(jwtUtil, never()).generateToken(anyString(), anyLong());
+            verify(jwtUtil, never()).generateToken(anyString(), anyLong(), any());
         }
 
         @Test
@@ -241,7 +241,7 @@ class AuthControllerTest {
             User user = buildUser(1L, "user", "用户", "ROLE_USER");
             when(userService.findByUsername("user")).thenReturn(user);
             when(passwordEncoder.matches("pass", user.getPassword())).thenReturn(true);
-            when(jwtUtil.generateToken(anyString(), anyLong())).thenReturn("test-token");
+            when(jwtUtil.generateToken(anyString(), anyLong(), any())).thenReturn("test-token");
 
             String responseBody = mockMvc.perform(post("/api/auth/login")
                             .contentType(MediaType.APPLICATION_JSON)

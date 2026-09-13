@@ -7,13 +7,18 @@ import com.photoalbum.entity.Photo;
 import com.photoalbum.entity.ShareLink;
 import com.photoalbum.mapper.PhotoMapper;
 import com.photoalbum.mapper.ShareLinkMapper;
+import com.photoalbum.security.AccessPolicy;
+import com.photoalbum.service.PhotoUrlResolver;
+import com.qcloud.cos.COSClient;
 import org.junit.jupiter.api.*;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.*;
 import org.mockito.junit.jupiter.MockitoExtension;
 import org.springframework.test.util.ReflectionTestUtils;
 
+import java.time.LocalDate;
 import java.time.LocalDateTime;
+import java.time.LocalTime;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
@@ -37,6 +42,14 @@ class ShareServiceTest {
     @Mock
     private PhotoMapper photoMapper;
 
+    /** 可见性策略：getByCode 需要用它判定"照片对当前调用者是否可见" */
+    @Mock
+    private AccessPolicy accessPolicy;
+
+    /** 对象存储客户端：地址解析器需要它做预签名（测试中不触发真实调用） */
+    @Mock
+    private COSClient cosClient;
+
     @InjectMocks
     private ShareServiceImpl shareService;
 
@@ -45,6 +58,14 @@ class ShareServiceTest {
     @BeforeEach
     void setUp() {
         ReflectionTestUtils.setField(shareService, "shareBaseUrl", SHARE_BASE_URL);
+        // 注入真实的地址解析器（内部只做字符串与签名处理，不发网络请求）
+        PhotoUrlResolver urlResolver = new PhotoUrlResolver(cosClient);
+        ReflectionTestUtils.setField(urlResolver, "cosBucket", "test-bucket");
+        ReflectionTestUtils.setField(urlResolver, "cosDomain", "https://cos.example.com");
+        ReflectionTestUtils.setField(urlResolver, "accessUrlPrefix", "/files/");
+        ReflectionTestUtils.setField(urlResolver, "presignedTtlMinutes", 60L);
+        ReflectionTestUtils.setField(urlResolver, "privateAclEnabled", false);
+        ReflectionTestUtils.setField(shareService, "photoUrlResolver", urlResolver);
     }
 
     // ============================================================
@@ -67,7 +88,7 @@ class ShareServiceTest {
             when(shareLinkMapper.insert(any(ShareLink.class))).thenReturn(1);
 
             // Act
-            ShareLinkDTO result = shareService.createShareLink(photoId);
+            ShareLinkDTO result = shareService.createShareLink(photoId, null);
 
             // Assert: code 非空且为 8 位
             assertNotNull(result);
@@ -85,7 +106,8 @@ class ShareServiceTest {
             // 验证关联照片信息
             assertEquals(photoId, result.getPhotoId());
             assertEquals("测试照片", result.getPhotoTitle());
-            assertEquals("2026/05/test.jpg", result.getPhotoUrl());
+            // 非对象存储路径会补全为本地访问前缀（由 PhotoUrlResolver 统一处理）
+            assertEquals("/files/2026/05/test.jpg", result.getPhotoUrl());
 
             // 验证 insert 被调用
             verify(shareLinkMapper).insert(any(ShareLink.class));
@@ -108,10 +130,10 @@ class ShareServiceTest {
             when(shareLinkMapper.selectOne(any(LambdaQueryWrapper.class))).thenReturn(existingLink);
 
             // Act: 第一次创建
-            ShareLinkDTO result1 = shareService.createShareLink(photoId);
+            ShareLinkDTO result1 = shareService.createShareLink(photoId, null);
 
             // Act: 第二次创建（同一个 photoId）
-            ShareLinkDTO result2 = shareService.createShareLink(photoId);
+            ShareLinkDTO result2 = shareService.createShareLink(photoId, null);
 
             // Assert: 两次返回相同的 code（复用已有链接）
             assertEquals("AbCd1234", result1.getCode(), "第一次应返回已有 code");
@@ -136,7 +158,7 @@ class ShareServiceTest {
 
             // Act & Assert
             BusinessException ex = assertThrows(BusinessException.class, () ->
-                    shareService.createShareLink(nonExistentPhotoId)
+                    shareService.createShareLink(nonExistentPhotoId, null)
             );
 
             assertEquals(404, ex.getCode());
@@ -145,6 +167,68 @@ class ShareServiceTest {
             // 验证没有尝试创建分享链接
             verify(shareLinkMapper, never()).selectOne(any());
             verify(shareLinkMapper, never()).insert(any());
+        }
+
+        @Test
+        @DisplayName("指定到期日创建分享链接，到期时间应归一化为当日 23:59:59")
+        void shouldNormalizeExpiryDateToEndOfDay() {
+            // Arrange
+            Long photoId = 1L;
+            Photo photo = buildPhoto(photoId, "限时照片", "2026/05/limited.jpg");
+            LocalDate expiryDate = LocalDate.now().plusDays(7);
+
+            when(photoMapper.selectById(photoId)).thenReturn(photo);
+            when(shareLinkMapper.selectOne(any(LambdaQueryWrapper.class))).thenReturn(null);
+            when(shareLinkMapper.selectCount(any(LambdaQueryWrapper.class))).thenReturn(0L);
+            when(shareLinkMapper.insert(any(ShareLink.class))).thenReturn(1);
+
+            // Act
+            ShareLinkDTO result = shareService.createShareLink(photoId, expiryDate.atStartOfDay());
+
+            // Assert
+            assertNotNull(result.getExpiresAt());
+            assertEquals(expiryDate, result.getExpiresAt().toLocalDate());
+            assertEquals(LocalTime.of(23, 59, 59), result.getExpiresAt().toLocalTime());
+            assertFalse(result.getExpired());
+        }
+
+        @Test
+        @DisplayName("到期时间早于当前时间时，创建应失败（400）且不写入记录")
+        void shouldRejectPastExpiry() {
+            // Arrange
+            Long photoId = 1L;
+            when(photoMapper.selectById(photoId))
+                    .thenReturn(buildPhoto(photoId, "照片", "p.jpg"));
+
+            // Act & Assert
+            BusinessException ex = assertThrows(BusinessException.class, () ->
+                    shareService.createShareLink(photoId, LocalDateTime.now().minusDays(1))
+            );
+
+            assertEquals(400, ex.getCode());
+            assertThat(ex.getMessage()).contains("到期时间");
+            verify(shareLinkMapper, never()).insert(any());
+        }
+
+        @Test
+        @DisplayName("重复创建时按本次设置更新有效期，不新增记录")
+        void shouldUpdateExpiryWhenLinkExists() {
+            // Arrange
+            Long photoId = 1L;
+            Photo photo = buildPhoto(photoId, "照片", "p.jpg");
+            ShareLink existing = buildShareLink(100L, "AbCd1234", photoId);
+
+            when(photoMapper.selectById(photoId)).thenReturn(photo);
+            when(shareLinkMapper.selectOne(any(LambdaQueryWrapper.class))).thenReturn(existing);
+
+            // Act
+            ShareLinkDTO result = shareService.createShareLink(photoId, LocalDate.now().plusDays(3).atStartOfDay());
+
+            // Assert：复用同一 code，仅更新到期时间
+            assertEquals("AbCd1234", result.getCode());
+            assertNotNull(result.getExpiresAt());
+            verify(shareLinkMapper).updateById(any(ShareLink.class));
+            verify(shareLinkMapper, never()).insert(any(ShareLink.class));
         }
     }
 
@@ -175,6 +259,8 @@ class ShareServiceTest {
 
             when(shareLinkMapper.selectOne(any(LambdaQueryWrapper.class))).thenReturn(shareLink);
             when(photoMapper.selectById(photoId)).thenReturn(photo);
+            // 公开照片：可见性策略放行
+            when(accessPolicy.canViewPhoto(any(), any())).thenReturn(true);
 
             // Act
             ShareLinkDTO result = shareService.getByCode(code);
@@ -261,6 +347,70 @@ class ShareServiceTest {
             assertNotNull(ex);
             assertEquals(404, ex.getCode());
             assertThat(ex.getMessage()).contains("分享链接");
+        }
+
+        @Test
+        @DisplayName("照片为私密且调用者无权访问时，分享链接应视为不存在（分享不突破私密标记）")
+        void shouldRejectShareLinkForPrivatePhoto() {
+            // Arrange
+            String code = "Priv1234";
+            ShareLink shareLink = buildShareLink(1L, code, 1L);
+            Photo photo = buildPhoto(1L, "私密照片", "secret.jpg");
+            photo.setIsPrivate(1);
+
+            when(shareLinkMapper.selectOne(any(LambdaQueryWrapper.class))).thenReturn(shareLink);
+            when(photoMapper.selectById(1L)).thenReturn(photo);
+            when(accessPolicy.canViewPhoto(any(), any())).thenReturn(false);
+
+            // Act & Assert：返回"不存在或已失效"，不暴露照片信息
+            BusinessException ex = assertThrows(BusinessException.class, () ->
+                    shareService.getByCode(code)
+            );
+
+            assertEquals(404, ex.getCode());
+            assertThat(ex.getMessage()).contains("分享链接");
+        }
+
+        @Test
+        @DisplayName("分享链接已过期时，应视为不存在，且不再查询照片")
+        void shouldRejectExpiredShareLink() {
+            // Arrange
+            String code = "Expd1234";
+            ShareLink shareLink = buildShareLink(1L, code, 1L);
+            shareLink.setExpiresAt(LocalDateTime.now().minusDays(1));
+
+            when(shareLinkMapper.selectOne(any(LambdaQueryWrapper.class))).thenReturn(shareLink);
+
+            // Act & Assert
+            BusinessException ex = assertThrows(BusinessException.class, () ->
+                    shareService.getByCode(code)
+            );
+
+            assertEquals(404, ex.getCode());
+            verify(photoMapper, never()).selectById(anyLong());
+        }
+
+        @Test
+        @DisplayName("未过期的限时链接可以正常访问，且返回到期时间")
+        void shouldAllowValidLimitedLink() {
+            // Arrange
+            String code = "Valid123";
+            LocalDateTime expiresAt = LocalDateTime.now().plusDays(1);
+            ShareLink shareLink = buildShareLink(1L, code, 1L);
+            shareLink.setExpiresAt(expiresAt);
+            Photo photo = buildPhoto(1L, "限时分享", "limited.jpg");
+
+            when(shareLinkMapper.selectOne(any(LambdaQueryWrapper.class))).thenReturn(shareLink);
+            when(photoMapper.selectById(1L)).thenReturn(photo);
+            when(accessPolicy.canViewPhoto(any(), any())).thenReturn(true);
+
+            // Act
+            ShareLinkDTO result = shareService.getByCode(code);
+
+            // Assert
+            assertNotNull(result);
+            assertEquals(expiresAt, result.getExpiresAt());
+            assertFalse(result.getExpired());
         }
     }
 
@@ -434,9 +584,9 @@ class ShareServiceTest {
             when(shareLinkMapper.insert(any(ShareLink.class))).thenReturn(1);
 
             // Act
-            ShareLinkDTO dto1 = shareService.createShareLink(1L);
-            ShareLinkDTO dto2 = shareService.createShareLink(2L);
-            ShareLinkDTO dto3 = shareService.createShareLink(3L);
+            ShareLinkDTO dto1 = shareService.createShareLink(1L, null);
+            ShareLinkDTO dto2 = shareService.createShareLink(2L, null);
+            ShareLinkDTO dto3 = shareService.createShareLink(3L, null);
 
             // Assert: 三个码应各不相同（SecureRandom 生成的冲突概率极低）
             assertNotEquals(dto1.getCode(), dto2.getCode(), "不同照片的分享码不应相同");

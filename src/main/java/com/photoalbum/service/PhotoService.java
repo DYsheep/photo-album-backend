@@ -74,6 +74,14 @@ public interface PhotoService extends IService<Photo> {
     /** Entity → DTO 转换，供 Controller 复用 */
     PhotoDTO toDTO(Photo photo);
 
-    /** 点赞照片，返回最新点赞数 */
+    /** 点赞照片，返回最新点赞数（原子自增，避免并发丢更新） */
     int likePhoto(Long id);
+
+    /** 浏览量 +1，返回最新浏览量（原子自增，避免并发丢更新） */
+    int incrementViewCount(Long id);
+
+    /**
+     * 修复存量私密照片的对象 ACL（一次性维护动作，返回处理数量）
+     */
+    int repairPrivateAcl();
 }

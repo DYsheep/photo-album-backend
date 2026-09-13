@@ -18,6 +18,12 @@ public class ShareLinkDTO {
 
     private LocalDateTime createdAt;
 
+    /** 到期时间（null = 永久有效） */
+    private LocalDateTime expiresAt;
+
+    /** 是否已过期（响应中直接给出，便于前端展示状态） */
+    private Boolean expired;
+
     /** 完整分享链接，如 https://域名/share/XXXX */
     private String shareUrl;
 

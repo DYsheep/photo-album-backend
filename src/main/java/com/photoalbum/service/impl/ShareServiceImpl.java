@@ -7,6 +7,9 @@ import com.photoalbum.entity.Photo;
 import com.photoalbum.entity.ShareLink;
 import com.photoalbum.mapper.PhotoMapper;
 import com.photoalbum.mapper.ShareLinkMapper;
+import com.photoalbum.security.AccessPolicy;
+import com.photoalbum.security.CurrentUserSupport;
+import com.photoalbum.service.PhotoUrlResolver;
 import com.photoalbum.service.ShareService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -15,12 +18,16 @@ import org.springframework.stereotype.Service;
 
 import java.security.SecureRandom;
 import java.time.LocalDateTime;
-import java.util.ArrayList;
+import java.time.LocalTime;
 import java.util.List;
 import java.util.stream.Collectors;
 
 /**
  * 分享链接服务实现
+ *
+ * 两条安全约束（与账号权限模型保持一致）：
+ *   1. 分享链接不突破可见性策略：照片被设为私密后，无权访问者通过分享链接同样不可见（返回"不存在或已失效"）；
+ *   2. 分享链接有时效：到期即失效，支持永久。
  */
 @Slf4j
 @Service
@@ -32,8 +39,12 @@ public class ShareServiceImpl implements ShareService {
     private static final int CODE_LENGTH = 8;
     private static final int MAX_RETRY = 10;
 
+    private static final String NOT_FOUND = "分享链接不存在或已失效";
+
     private final ShareLinkMapper shareLinkMapper;
     private final PhotoMapper photoMapper;
+    private final AccessPolicy accessPolicy;
+    private final PhotoUrlResolver photoUrlResolver;
 
     @Value("${share.base-url:http://localhost:5173}")
     private String shareBaseUrl;
@@ -67,22 +78,24 @@ public class ShareServiceImpl implements ShareService {
     }
 
     @Override
-    public ShareLinkDTO createShareLink(Long photoId) {
+    public ShareLinkDTO createShareLink(Long photoId, LocalDateTime expiresAt) {
         // 校验照片是否存在
         Photo photo = photoMapper.selectById(photoId);
         if (photo == null) {
             throw new BusinessException(404, "照片不存在");
         }
 
-        // 检查是否已存在该照片的分享链接（复用已有）
+        LocalDateTime normalizedExpiry = normalizeExpiry(expiresAt);
+
+        // 同一张照片只保留一条链接：已存在则按本次设置更新有效期（永久传 null）
         ShareLink existing = shareLinkMapper.selectOne(
                 new LambdaQueryWrapper<ShareLink>().eq(ShareLink::getPhotoId, photoId));
         if (existing != null) {
-            ShareLinkDTO dto = toDTO(existing);
-            dto.setPhotoTitle(photo.getTitle());
-            dto.setPhotoUrl(photo.getUrl());
-            dto.setShareUrl(shareBaseUrl + "/share/" + existing.getCode());
-            return dto;
+            existing.setExpiresAt(normalizedExpiry);
+            shareLinkMapper.updateById(existing);
+            log.info("分享链接有效期已更新: photoId={}, code={}, expiresAt={}",
+                    photoId, existing.getCode(), normalizedExpiry);
+            return buildDto(existing, photo);
         }
 
         // 生成唯一分享码
@@ -91,33 +104,62 @@ public class ShareServiceImpl implements ShareService {
         ShareLink shareLink = new ShareLink();
         shareLink.setCode(code);
         shareLink.setPhotoId(photoId);
+        shareLink.setExpiresAt(normalizedExpiry);
         shareLink.setCreatedAt(LocalDateTime.now());
 
         shareLinkMapper.insert(shareLink);
-        log.info("分享链接创建成功: photoId={}, code={}", photoId, code);
+        log.info("分享链接创建成功: photoId={}, code={}, expiresAt={}", photoId, code, normalizedExpiry);
 
-        ShareLinkDTO dto = toDTO(shareLink);
-        dto.setPhotoTitle(photo.getTitle());
-        dto.setPhotoUrl(photo.getUrl());
-        dto.setShareUrl(shareBaseUrl + "/share/" + code);
-        return dto;
+        return buildDto(shareLink, photo);
+    }
+
+    /**
+     * 归一化并校验到期时间
+     *
+     * 只传日期（当天 00:00）时按"当日 23:59:59"处理，符合"到期日"的直觉；
+     * 传 null 表示永久有效。
+     */
+    private LocalDateTime normalizeExpiry(LocalDateTime expiresAt) {
+        if (expiresAt == null) {
+            return null;
+        }
+        LocalDateTime value = expiresAt;
+        if (LocalTime.MIDNIGHT.equals(value.toLocalTime())) {
+            value = value.toLocalDate().atTime(LocalTime.MAX.withNano(0));
+        }
+        if (!value.isAfter(LocalDateTime.now())) {
+            throw new BusinessException(400, "分享到期时间必须晚于当前时间");
+        }
+        return value;
     }
 
     @Override
     public ShareLinkDTO getByCode(String code) {
         if (code == null || code.isBlank()) {
-            throw new BusinessException(404, "分享链接不存在或已失效");
+            throw new BusinessException(404, NOT_FOUND);
         }
 
         ShareLink shareLink = shareLinkMapper.selectOne(
                 new LambdaQueryWrapper<ShareLink>().eq(ShareLink::getCode, code));
         if (shareLink == null) {
-            throw new BusinessException(404, "分享链接不存在或已失效");
+            throw new BusinessException(404, NOT_FOUND);
+        }
+
+        // 时效校验：到期即失效（永久链接 expiresAt 为 null）
+        if (shareLink.getExpiresAt() != null
+                && !shareLink.getExpiresAt().isAfter(LocalDateTime.now())) {
+            throw new BusinessException(404, NOT_FOUND);
         }
 
         Photo photo = photoMapper.selectById(shareLink.getPhotoId());
         if (photo == null) {
-            throw new BusinessException(404, "分享链接不存在或已失效");
+            throw new BusinessException(404, NOT_FOUND);
+        }
+
+        // 可见性联动：照片被设为私密后，无权限访问者通过分享链接同样看不到
+        // （分享链接是"可转发的能力"，但不能突破私密标记；照片改回公开后链接自动恢复可用）
+        if (!accessPolicy.canViewPhoto(CurrentUserSupport.getCurrentUser(), photo)) {
+            throw new BusinessException(404, NOT_FOUND);
         }
 
         ShareLinkDTO dto = toDTO(shareLink);
@@ -134,9 +176,8 @@ public class ShareServiceImpl implements ShareService {
         dto.setIso(photo.getIso());
         dto.setFocalLength(photo.getFocalLength());
         dto.setDateTaken(photo.getDateTaken());
-        // URL 补全
-        String url = photo.getUrl();
-        dto.setPhotoUrl(url != null && url.startsWith("http") ? url : "/files/" + url);
+        // URL 补全：公开照片直链，私密照片短期预签名地址
+        dto.setPhotoUrl(photoUrlResolver.resolve(photo.getUrl(), photo.getIsPrivate()));
 
         return dto;
     }
@@ -154,7 +195,7 @@ public class ShareServiceImpl implements ShareService {
             Photo photo = photoMapper.selectById(sl.getPhotoId());
             if (photo != null) {
                 dto.setPhotoTitle(photo.getTitle());
-                dto.setPhotoUrl(photo.getUrl());
+                dto.setPhotoUrl(photoUrlResolver.resolve(photo.getUrl(), photo.getIsPrivate()));
             }
             return dto;
         }).collect(Collectors.toList());
@@ -177,6 +218,18 @@ public class ShareServiceImpl implements ShareService {
         dto.setCode(shareLink.getCode());
         dto.setPhotoId(shareLink.getPhotoId());
         dto.setCreatedAt(shareLink.getCreatedAt());
+        dto.setExpiresAt(shareLink.getExpiresAt());
+        dto.setExpired(shareLink.getExpiresAt() != null
+                && !shareLink.getExpiresAt().isAfter(LocalDateTime.now()));
+        return dto;
+    }
+
+    /** 组装返回给前端的 DTO（链接创建/更新后的响应） */
+    private ShareLinkDTO buildDto(ShareLink shareLink, Photo photo) {
+        ShareLinkDTO dto = toDTO(shareLink);
+        dto.setShareUrl(shareBaseUrl + "/share/" + shareLink.getCode());
+        dto.setPhotoTitle(photo.getTitle());
+        dto.setPhotoUrl(photoUrlResolver.resolve(photo.getUrl(), photo.getIsPrivate()));
         return dto;
     }
 }

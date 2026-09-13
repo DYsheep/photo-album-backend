@@ -108,13 +108,15 @@ public class JwtUtil {
     /**
      * 生成 Token
      *
-     * @param username 用户名
-     * @param userId   用户ID
+     * @param username     用户名
+     * @param userId       用户ID
+     * @param tokenVersion 令牌版本（改密/登出后自增，用于吊销旧令牌）
      * @return JWT Token
      */
-    public String generateToken(String username, Long userId) {
+    public String generateToken(String username, Long userId, Integer tokenVersion) {
         Map<String, Object> claims = new HashMap<>();
         claims.put("userId", userId);
+        claims.put("ver", tokenVersion == null ? 0 : tokenVersion);
 
         Date now = new Date();
         Date expiryDate = new Date(now.getTime() + expiration);
@@ -126,6 +128,17 @@ public class JwtUtil {
                 .expiration(expiryDate)
                 .signWith(getSigningKey())
                 .compact();
+    }
+
+    /**
+     * 读取令牌内的版本号（历史令牌无该声明时视为 0）
+     */
+    public int getTokenVersion(String token) {
+        Object value = parseToken(token).get("ver");
+        if (value instanceof Number number) {
+            return number.intValue();
+        }
+        return 0;
     }
 
     /**

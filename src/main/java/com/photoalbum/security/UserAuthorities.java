@@ -73,7 +73,9 @@ public final class UserAuthorities {
             names.add(PHOTO_MANAGE);
             names.add(ADMIN_ACCESS);
         }
-        if (UserRoles.VIEWER.equals(role)) {
+        // 私密查看能力来自能力位，不再与角色名绑定：
+        // 角色退回为纯标识，新增角色类型无需改动鉴权代码
+        if (isEnabled(user.getCanViewPrivate())) {
             names.add(PHOTO_VIEW_PRIVATE);
         }
         return names;

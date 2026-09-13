@@ -62,6 +62,8 @@ public class SecurityConfig {
                 .requestMatchers(org.springframework.http.HttpMethod.POST, "/api/photos/*/like").permitAll()
                 // 用户与授权管理仅限管理员（与 UserAuthorities.USER_MANAGE 对应）
                 .requestMatchers("/api/admin/users/**").hasAuthority("user:manage")
+                // 合集列表：任何登录账号可访问，服务层对非管理者按"协作者"关系过滤（对象级管理权）
+                .requestMatchers(HttpMethod.GET, "/api/admin/collections").authenticated()
                 // 其余后台管理接口：管理员或具备管理权限的账号（canManage）
                 .requestMatchers("/api/admin/**").hasAuthority("admin:access")
                 // 其余 /api/** 接口均需认证（任何已登录用户）

@@ -72,29 +72,29 @@ public class CollectionController {
      * PUT /api/admin/collections/{id}
      */
     @PutMapping("/api/admin/collections/{id}")
-    @PreAuthorize("hasAuthority('photo:manage')")
+    @PreAuthorize("hasAuthority('photo:manage') or @collectionAccess.canManageCollection(#id, authentication)")
     public Result<CollectionDTO> update(@PathVariable Long id, @RequestBody CollectionDTO dto) {
         CollectionDTO result = collectionService.updateCollection(id, dto);
         return Result.ok(result);
     }
 
     /**
-     * 删除合集（需管理权限）
+     * 删除合集（需管理权限，或为该合集协作者）
      * DELETE /api/admin/collections/{id}
      */
     @DeleteMapping("/api/admin/collections/{id}")
-    @PreAuthorize("hasAuthority('photo:manage')")
+    @PreAuthorize("hasAuthority('photo:manage') or @collectionAccess.canManageCollection(#id, authentication)")
     public Result<Void> delete(@PathVariable Long id) {
         collectionService.deleteCollection(id);
         return Result.ok();
     }
 
     /**
-     * 向合集添加照片（需管理权限）
+     * 向合集添加照片（需管理权限，或为该合集协作者）
      * POST /api/admin/collections/{id}/photos/{photoId}
      */
     @PostMapping("/api/admin/collections/{id}/photos/{photoId}")
-    @PreAuthorize("hasAuthority('photo:manage')")
+    @PreAuthorize("hasAuthority('photo:manage') or @collectionAccess.canManageCollection(#collectionId, authentication)")
     public Result<Void> addPhoto(@PathVariable("id") Long collectionId,
                                   @PathVariable Long photoId) {
         collectionService.addPhoto(collectionId, photoId);
@@ -102,14 +102,52 @@ public class CollectionController {
     }
 
     /**
-     * 从合集移除照片（需管理权限）
+     * 从合集移除照片（需管理权限，或为该合集协作者）
      * DELETE /api/admin/collections/{id}/photos/{photoId}
      */
     @DeleteMapping("/api/admin/collections/{id}/photos/{photoId}")
-    @PreAuthorize("hasAuthority('photo:manage')")
+    @PreAuthorize("hasAuthority('photo:manage') or @collectionAccess.canManageCollection(#collectionId, authentication)")
     public Result<Void> removePhoto(@PathVariable("id") Long collectionId,
                                      @PathVariable Long photoId) {
         collectionService.removePhoto(collectionId, photoId);
+        return Result.ok();
+    }
+
+    // ========== 协作者管理（对象级管理权，仅管理权限账号可指派） ==========
+
+    /**
+     * 查看合集协作者（协作者本人也可查看）
+     * GET /api/admin/collections/{id}/members
+     */
+    @GetMapping("/api/admin/collections/{id}/members")
+    @PreAuthorize("hasAuthority('photo:manage') or @collectionAccess.canManageCollection(#id, authentication)")
+    public Result<List<Map<String, Object>>> listMembers(@PathVariable Long id) {
+        return Result.ok(collectionService.listMembers(id));
+    }
+
+    /**
+     * 指派协作者
+     * POST /api/admin/collections/{id}/members/{userId}
+     */
+    @PostMapping("/api/admin/collections/{id}/members/{userId}")
+    @PreAuthorize("hasAuthority('photo:manage')")
+    public Result<Void> addMember(@PathVariable Long id, @PathVariable Long userId) {
+        try {
+            collectionService.addMember(id, userId);
+            return Result.ok();
+        } catch (com.photoalbum.common.BusinessException e) {
+            return Result.fail(e.getCode(), e.getMessage());
+        }
+    }
+
+    /**
+     * 移除协作者
+     * DELETE /api/admin/collections/{id}/members/{userId}
+     */
+    @DeleteMapping("/api/admin/collections/{id}/members/{userId}")
+    @PreAuthorize("hasAuthority('photo:manage')")
+    public Result<Void> removeMember(@PathVariable Long id, @PathVariable Long userId) {
+        collectionService.removeMember(id, userId);
         return Result.ok();
     }
 

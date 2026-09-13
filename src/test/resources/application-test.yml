@@ -8,6 +8,11 @@ spring:
     username: sa
     password:
 
+  # 测试环境不启用 Flyway（V1 基线为 MySQL 语法，H2 不兼容；
+  # 现有测试不依赖真实数据库，Mapper 均为 mock）
+  flyway:
+    enabled: false
+
   # H2 控制台（调试用）
   h2:
     console:

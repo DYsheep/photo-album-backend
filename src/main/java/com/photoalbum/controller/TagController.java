@@ -1,19 +1,21 @@
 package com.photoalbum.controller;
 
+import com.photoalbum.common.BusinessException;
 import com.photoalbum.common.Result;
-import com.photoalbum.entity.Photo;
-import com.photoalbum.mapper.PhotoMapper;
+import com.photoalbum.service.TagService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.security.access.prepost.PreAuthorize;
-import org.springframework.transaction.annotation.Transactional;
 import org.springframework.web.bind.annotation.*;
 
-import java.util.*;
-import java.util.stream.Collectors;
+import java.util.List;
+import java.util.Map;
 
 /**
  * 标签管理控制器（需管理权限：photo:manage）
+ *
+ * 标签的权威数据在 t_tag / t_photo_tag（关联表），本控制器只做参数整理与调用，
+ * 重命名/合并/删除不再对全表做字符串替换。
  */
 @Slf4j
 @RestController
@@ -22,61 +24,29 @@ import java.util.stream.Collectors;
 @PreAuthorize("hasAuthority('photo:manage')")
 public class TagController {
 
-    private final PhotoMapper photoMapper;
+    private final TagService tagService;
 
     /**
-     * 获取所有标签及引用数
+     * 标签列表及引用数（关联表聚合）
      * GET /api/admin/tags
      */
     @GetMapping
     public Result<List<Map<String, Object>>> list() {
-        List<Map<String, Object>> tagList = buildTagList();
-        return Result.ok(tagList);
+        return Result.ok(tagService.listWithCounts());
     }
 
     /**
      * 重命名标签
-     * PUT /api/admin/tags/rename  Body: {oldName, newName}
+     * PUT /api/admin/tags/rename  Body: { oldName, newName }
      */
     @PutMapping("/rename")
-    @Transactional(rollbackFor = Exception.class)
     public Result<Void> rename(@RequestBody Map<String, String> body) {
-        String oldName = body.get("oldName");
-        String newName = body.get("newName");
-
-        if (oldName == null || oldName.isBlank() || newName == null || newName.isBlank()) {
-            return Result.fail("标签名不能为空");
+        try {
+            tagService.rename(body.get("oldName"), body.get("newName"));
+            return Result.ok();
+        } catch (BusinessException e) {
+            return Result.fail(e.getCode(), e.getMessage());
         }
-
-        if (oldName.equals(newName)) {
-            return Result.fail("新旧标签名相同");
-        }
-
-        List<Photo> allPhotos = photoMapper.selectList(null);
-        int updatedCount = 0;
-
-        for (Photo photo : allPhotos) {
-            String tags = photo.getTags();
-            if (tags == null || tags.isBlank()) continue;
-
-            String[] tagArray = tags.split(",");
-            boolean modified = false;
-            for (int i = 0; i < tagArray.length; i++) {
-                if (tagArray[i].trim().equals(oldName)) {
-                    tagArray[i] = newName;
-                    modified = true;
-                }
-            }
-
-            if (modified) {
-                photo.setTags(String.join(",", tagArray));
-                photoMapper.updateById(photo);
-                updatedCount++;
-            }
-        }
-
-        log.info("标签重命名: {} -> {}, 影响 {} 张照片", oldName, newName, updatedCount);
-        return Result.ok();
     }
 
     /**
@@ -84,120 +54,45 @@ public class TagController {
      * DELETE /api/admin/tags/{name}
      */
     @DeleteMapping("/{name}")
-    @Transactional(rollbackFor = Exception.class)
     public Result<Void> delete(@PathVariable String name) {
-        if (name == null || name.isBlank()) {
-            return Result.fail("标签名不能为空");
+        try {
+            tagService.deleteTag(name);
+            return Result.ok();
+        } catch (BusinessException e) {
+            return Result.fail(e.getCode(), e.getMessage());
         }
-
-        List<Photo> allPhotos = photoMapper.selectList(null);
-        int updatedCount = 0;
-
-        for (Photo photo : allPhotos) {
-            String tags = photo.getTags();
-            if (tags == null || tags.isBlank()) continue;
-
-            List<String> tagList = new ArrayList<>();
-            for (String t : tags.split(",")) {
-                String trimmed = t.trim();
-                if (!trimmed.isEmpty() && !trimmed.equals(name)) {
-                    tagList.add(trimmed);
-                }
-            }
-
-            String newTags = String.join(",", tagList);
-            if (!newTags.equals(tags)) {
-                photo.setTags(newTags);
-                photoMapper.updateById(photo);
-                updatedCount++;
-            }
-        }
-
-        log.info("标签删除: {}, 影响 {} 张照片", name, updatedCount);
-        return Result.ok();
     }
 
     /**
      * 合并标签
-     * POST /api/admin/tags/merge  Body: {sourceNames:[...], targetName}
+     * POST /api/admin/tags/merge  Body: { sourceNames: [], targetName }
      */
     @PostMapping("/merge")
-    @Transactional(rollbackFor = Exception.class)
+    @SuppressWarnings("unchecked")
     public Result<Void> merge(@RequestBody Map<String, Object> body) {
-        @SuppressWarnings("unchecked")
-        List<String> sourceNames = (List<String>) body.get("sourceNames");
-        String targetName = (String) body.get("targetName");
-
-        if (sourceNames == null || sourceNames.isEmpty()) {
-            return Result.fail("源标签不能为空");
+        Object sources = body.get("sourceNames");
+        if (!(sources instanceof List<?> list) || list.isEmpty()) {
+            return Result.fail("请选择要合并的标签");
         }
-        if (targetName == null || targetName.isBlank()) {
-            return Result.fail("目标标签名不能为空");
+        List<String> sourceNames = ((List<Object>) list).stream()
+                .filter(java.util.Objects::nonNull)
+                .map(String::valueOf)
+                .collect(java.util.stream.Collectors.toList());
+        try {
+            tagService.merge(sourceNames, (String) body.get("targetName"));
+            return Result.ok();
+        } catch (BusinessException e) {
+            return Result.fail(e.getCode(), e.getMessage());
         }
-
-        Set<String> sourceSet = new HashSet<>(sourceNames);
-        sourceSet.remove(targetName); // 防止目标标签在源列表中
-
-        List<Photo> allPhotos = photoMapper.selectList(null);
-        int updatedCount = 0;
-
-        for (Photo photo : allPhotos) {
-            String tags = photo.getTags();
-            if (tags == null || tags.isBlank()) continue;
-
-            Set<String> tagSet = new LinkedHashSet<>();
-            for (String t : tags.split(",")) {
-                String trimmed = t.trim();
-                if (trimmed.isEmpty()) continue;
-                if (sourceSet.contains(trimmed)) {
-                    // 源标签替换为目标标签
-                    tagSet.add(targetName);
-                } else {
-                    tagSet.add(trimmed);
-                }
-            }
-
-            String newTags = String.join(",", tagSet);
-            if (!newTags.equals(tags)) {
-                photo.setTags(newTags);
-                photoMapper.updateById(photo);
-                updatedCount++;
-            }
-        }
-
-        log.info("标签合并: {} -> {}, 影响 {} 张照片", sourceNames, targetName, updatedCount);
-        return Result.ok();
     }
 
-    // ========== 私有工具方法 ==========
-
     /**
-     * 构建标签列表（含引用计数），按 count 降序
+     * 以展示字段为准重建标签索引（一次性维护动作，用于修复历史数据漂移）
+     * POST /api/admin/tags/rebuild
      */
-    private List<Map<String, Object>> buildTagList() {
-        List<Photo> allPhotos = photoMapper.selectList(null);
-        Map<String, Long> tagCountMap = new HashMap<>();
-
-        for (Photo photo : allPhotos) {
-            String tagsStr = photo.getTags();
-            if (tagsStr == null || tagsStr.isBlank()) continue;
-            for (String tag : tagsStr.split(",")) {
-                String trimmed = tag.trim();
-                if (!trimmed.isEmpty()) {
-                    tagCountMap.merge(trimmed, 1L, Long::sum);
-                }
-            }
-        }
-
-        return tagCountMap.entrySet().stream()
-                .map(entry -> {
-                    Map<String, Object> item = new HashMap<>();
-                    item.put("name", entry.getKey());
-                    item.put("count", entry.getValue());
-                    return item;
-                })
-                .sorted((a, b) -> Long.compare(
-                        (Long) b.get("count"), (Long) a.get("count")))
-                .collect(Collectors.toList());
+    @PostMapping("/rebuild")
+    public Result<Map<String, Object>> rebuild() {
+        int count = tagService.rebuildIndex();
+        return Result.ok("已重建 " + count + " 张照片的标签索引", Map.of("rebuilt", count));
     }
 }

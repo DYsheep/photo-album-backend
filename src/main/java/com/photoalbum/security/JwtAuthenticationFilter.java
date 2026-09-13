@@ -46,8 +46,8 @@ public class JwtAuthenticationFilter extends OncePerRequestFilter {
         if (StringUtils.hasText(token) && jwtUtil.validateToken(token)) {
             String username = jwtUtil.getUsername(token);
             User user = userService.findByUsername(username);
-            if (user != null) {
-                // 权限标记由 UserAuthorities 统一派生（角色 + 功能位 → 权限标记的唯一入口）
+            if (user != null && !isTokenRevoked(token, user)) {
+                // 权限标记由 UserAuthorities 统一派生（角色 + 能力位 → 权限标记的唯一入口）
                 UsernamePasswordAuthenticationToken authentication =
                         new UsernamePasswordAuthenticationToken(user, null, UserAuthorities.of(user));
                 SecurityContextHolder.getContext().setAuthentication(authentication);
@@ -55,6 +55,16 @@ public class JwtAuthenticationFilter extends OncePerRequestFilter {
         }
 
         filterChain.doFilter(request, response);
+    }
+
+    /**
+     * 令牌是否已被吊销
+     *
+     * 账号的 tokenVersion 在改密、退出登录时自增，旧令牌携带的版本号随之失效。
+     */
+    private boolean isTokenRevoked(String token, User user) {
+        int current = user.getTokenVersion() == null ? 0 : user.getTokenVersion();
+        return jwtUtil.getTokenVersion(token) != current;
     }
 
     /**

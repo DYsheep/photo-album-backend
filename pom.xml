@@ -103,6 +103,16 @@
             <version>2.19.0</version>
         </dependency>
 
+        <!-- 数据库迁移（Flyway）：结构变更纳入版本管理，随应用启动自动执行 -->
+        <dependency>
+            <groupId>org.flywaydb</groupId>
+            <artifactId>flyway-core</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.flywaydb</groupId>
+            <artifactId>flyway-mysql</artifactId>
+        </dependency>
+
         <!-- H2 内存数据库（测试环境） -->
         <dependency>
             <groupId>com.h2database</groupId>

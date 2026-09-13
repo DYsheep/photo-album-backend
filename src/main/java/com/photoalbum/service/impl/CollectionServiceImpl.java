@@ -10,12 +10,17 @@ import com.photoalbum.entity.PhotoCollection;
 import com.photoalbum.entity.PhotoCollectionPhoto;
 import com.photoalbum.entity.User;
 import com.photoalbum.mapper.CategoryMapper;
+import com.photoalbum.mapper.CollectionMemberMapper;
 import com.photoalbum.mapper.PhotoCollectionMapper;
 import com.photoalbum.mapper.PhotoCollectionPhotoMapper;
 import com.photoalbum.mapper.PhotoMapper;
+import com.photoalbum.mapper.UserMapper;
+import com.photoalbum.entity.CollectionMember;
 import com.photoalbum.security.AccessPolicy;
 import com.photoalbum.security.CurrentUserSupport;
+import com.photoalbum.security.UserAuthorities;
 import com.photoalbum.service.CollectionService;
+import com.photoalbum.service.PhotoUrlResolver;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
@@ -25,8 +30,10 @@ import org.springframework.transaction.annotation.Transactional;
 import java.time.LocalDateTime;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.stream.Collectors;
 
 @Slf4j
@@ -39,6 +46,9 @@ public class CollectionServiceImpl implements CollectionService {
     private final PhotoMapper photoMapper;
     private final CategoryMapper categoryMapper;
     private final AccessPolicy accessPolicy;
+    private final PhotoUrlResolver photoUrlResolver;
+    private final CollectionMemberMapper memberMapper;
+    private final UserMapper userMapper;
 
     @Value("${file.access-url-prefix}")
     private String accessUrlPrefix;
@@ -59,11 +69,6 @@ public class CollectionServiceImpl implements CollectionService {
         return collection;
     }
 
-    /** 照片是否对当前调用者可见（可见性统一由 AccessPolicy 判定） */
-    private boolean canView(Photo photo) {
-        return accessPolicy.canViewPhoto(getCurrentUser(), photo);
-    }
-
     @Override
     public List<CollectionDTO> getPublishedCollections() {
         LambdaQueryWrapper<PhotoCollection> wrapper = new LambdaQueryWrapper<>();
@@ -80,24 +85,33 @@ public class CollectionServiceImpl implements CollectionService {
     public CollectionDTO getCollectionDetail(Long id) {
         PhotoCollection collection = requireAccessibleCollection(id);
         CollectionDTO dto = toDTO(collection);
-        dto.setPhotos(getCollectionPhotos(id));
+        dto.setPhotos(buildPhotos(collection));
         return dto;
     }
 
     @Override
     public List<PhotoDTO> getCollectionPhotos(Long collectionId) {
         // 合集自身不可访问时直接 404，避免未发布/私密合集内照片被枚举读取
-        requireAccessibleCollection(collectionId);
+        return buildPhotos(requireAccessibleCollection(collectionId));
+    }
 
+    /**
+     * 组装合集内对当前调用者可见的照片
+     *
+     * 已持有合集对象，逐张判定由 AccessPolicy 在内存中完成（不产生额外查询），
+     * 避免"每张私密照片各查一次权限表"的 N+1。
+     */
+    private List<PhotoDTO> buildPhotos(PhotoCollection collection) {
         LambdaQueryWrapper<PhotoCollectionPhoto> wrapper = new LambdaQueryWrapper<>();
-        wrapper.eq(PhotoCollectionPhoto::getCollectionId, collectionId)
+        wrapper.eq(PhotoCollectionPhoto::getCollectionId, collection.getId())
                 .orderByAsc(PhotoCollectionPhoto::getSortOrder);
 
         List<PhotoCollectionPhoto> relations = collectionPhotoMapper.selectList(wrapper);
-        List<PhotoDTO> result = new ArrayList<>();
+        User user = getCurrentUser();
+        List<PhotoDTO> result = new ArrayList<>(relations.size());
         for (PhotoCollectionPhoto rel : relations) {
             Photo photo = photoMapper.selectById(rel.getPhotoId());
-            if (photo != null && canView(photo)) {
+            if (photo != null && accessPolicy.canViewPhotoInCollection(user, photo, collection.getId())) {
                 result.add(toPhotoDTO(photo));
             }
         }
@@ -110,7 +124,80 @@ public class CollectionServiceImpl implements CollectionService {
         wrapper.orderByAsc(PhotoCollection::getSortOrder)
                 .orderByDesc(PhotoCollection::getCreatedAt);
         List<PhotoCollection> list = collectionMapper.selectList(wrapper);
-        return list.stream().map(this::toDTO).collect(Collectors.toList());
+
+        User user = getCurrentUser();
+        if (user == null) {
+            return List.of();
+        }
+        // 具备内容管理权限：可见全部合集（含未发布草稿）
+        if (UserAuthorities.hasManageAccess(user)) {
+            return list.stream().map(this::toDTO).collect(Collectors.toList());
+        }
+        // 非管理者（协作者）：只返回被指派负责的合集
+        Set<Long> memberCollectionIds = memberMapper.selectList(
+                        new LambdaQueryWrapper<CollectionMember>().eq(CollectionMember::getUserId, user.getId()))
+                .stream().map(CollectionMember::getCollectionId).collect(Collectors.toSet());
+        if (memberCollectionIds.isEmpty()) {
+            return List.of();
+        }
+        return list.stream()
+                .filter(c -> memberCollectionIds.contains(c.getId()))
+                .map(this::toDTO)
+                .collect(Collectors.toList());
+    }
+
+    @Override
+    public List<Map<String, Object>> listMembers(Long collectionId) {
+        List<CollectionMember> members = memberMapper.selectList(
+                new LambdaQueryWrapper<CollectionMember>()
+                        .eq(CollectionMember::getCollectionId, collectionId)
+                        .orderByAsc(CollectionMember::getId));
+        List<Map<String, Object>> result = new ArrayList<>(members.size());
+        for (CollectionMember member : members) {
+            User memberUser = userMapper.selectById(member.getUserId());
+            Map<String, Object> item = new LinkedHashMap<>();
+            item.put("userId", member.getUserId());
+            item.put("username", memberUser != null ? memberUser.getUsername() : null);
+            item.put("nickname", memberUser != null ? memberUser.getNickname() : null);
+            item.put("memberRole", member.getMemberRole());
+            item.put("createdAt", member.getCreatedAt());
+            result.add(item);
+        }
+        return result;
+    }
+
+    @Override
+    @Transactional
+    public void addMember(Long collectionId, Long userId) {
+        if (collectionMapper.selectById(collectionId) == null) {
+            throw new BusinessException(404, "合集不存在");
+        }
+        if (userMapper.selectById(userId) == null) {
+            throw new BusinessException(404, "用户不存在");
+        }
+        Long exists = memberMapper.selectCount(new LambdaQueryWrapper<CollectionMember>()
+                .eq(CollectionMember::getCollectionId, collectionId)
+                .eq(CollectionMember::getUserId, userId));
+        if (exists != null && exists > 0) {
+            return; // 幂等
+        }
+        CollectionMember member = new CollectionMember();
+        member.setCollectionId(collectionId);
+        member.setUserId(userId);
+        member.setMemberRole("editor");
+        User operator = getCurrentUser();
+        member.setCreatedBy(operator != null ? operator.getId() : null);
+        memberMapper.insert(member);
+        log.info("合集协作者已指派: collectionId={}, userId={}", collectionId, userId);
+    }
+
+    @Override
+    @Transactional
+    public void removeMember(Long collectionId, Long userId) {
+        memberMapper.delete(new LambdaQueryWrapper<CollectionMember>()
+                .eq(CollectionMember::getCollectionId, collectionId)
+                .eq(CollectionMember::getUserId, userId));
+        log.info("合集协作者已移除: collectionId={}, userId={}", collectionId, userId);
     }
 
     @Override
@@ -263,11 +350,9 @@ public class CollectionServiceImpl implements CollectionService {
         dto.setTitle(photo.getTitle());
         dto.setDescription(photo.getDescription());
         dto.setCategoryId(photo.getCategoryId());
-        String url = photo.getUrl();
-        dto.setUrl(url != null && url.startsWith("http") ? url : accessUrlPrefix + url);
-        String thumbUrl = photo.getThumbnailUrl();
-        dto.setThumbnailUrl(thumbUrl != null && !thumbUrl.isEmpty()
-                ? (thumbUrl.startsWith("http") ? thumbUrl : accessUrlPrefix + thumbUrl) : null);
+        // 公开照片直链；私密照片短期预签名地址
+        dto.setUrl(photoUrlResolver.resolve(photo.getUrl(), photo.getIsPrivate()));
+        dto.setThumbnailUrl(photoUrlResolver.resolveThumbnail(photo.getThumbnailUrl(), photo.getIsPrivate()));
         dto.setFileName(photo.getFileName());
         dto.setFileSize(photo.getFileSize());
         dto.setTags(photo.getTags());

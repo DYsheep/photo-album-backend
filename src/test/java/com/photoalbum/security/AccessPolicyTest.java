@@ -22,6 +22,8 @@ import java.util.List;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 /**
@@ -39,6 +41,14 @@ class AccessPolicyTest {
 
     @Mock
     private PhotoCollectionPhotoMapper collectionPhotoMapper;
+
+    /** 合集协作者关系（对象级管理权） */
+    @Mock
+    private com.photoalbum.mapper.CollectionMemberMapper collectionMemberMapper;
+
+    /** 标签表（把标签级授权翻译成标签名，供内存精确匹配） */
+    @Mock
+    private com.photoalbum.mapper.TagMapper tagMapper;
 
     @InjectMocks
     private AccessPolicy policy;
@@ -68,7 +78,7 @@ class AccessPolicyTest {
             AccessPolicy.PrivateScope scope = policy.photoScope(normal);
 
             assertThat(scope.all()).isFalse();
-            assertThat(scope.allowed()).isEmpty();
+            assertThat(scope.allowedPhotoIds()).isEmpty();
             assertThat(policy.canViewPhoto(normal, photo(1L, 1))).isFalse();
             assertThat(policy.canViewPhoto(normal, photo(1L, 0))).isTrue();
         }
@@ -93,12 +103,12 @@ class AccessPolicyTest {
         @DisplayName("viewer 无任何授权条目：默认拒绝（此前的行为是可看全部私密）")
         void viewerWithoutGrantsIsDeniedByDefault() {
             when(permMapper.selectList(any())).thenReturn(Collections.emptyList());
-            User viewer = user("viewer", 0, 0);
+            User viewer = viewer();
 
             AccessPolicy.PrivateScope scope = policy.photoScope(viewer);
 
             assertThat(scope.all()).isFalse();
-            assertThat(scope.allowed()).isEmpty();
+            assertThat(scope.allowedPhotoIds()).isEmpty();
             assertThat(policy.canViewPhoto(viewer, photo(5L, 1))).isFalse();
         }
 
@@ -106,7 +116,7 @@ class AccessPolicyTest {
         @DisplayName("viewer 照片白名单：仅授权照片可见")
         void viewerWithPhotoWhitelist() {
             when(permMapper.selectList(any())).thenReturn(List.of(grant("W", "photo", 5L)));
-            User viewer = user("viewer", 0, 0);
+            User viewer = viewer();
 
             assertThat(policy.canViewPhoto(viewer, photo(5L, 1))).isTrue();
             assertThat(policy.canViewPhoto(viewer, photo(6L, 1))).isFalse();
@@ -114,24 +124,33 @@ class AccessPolicyTest {
         }
 
         @Test
-        @DisplayName("viewer 合集白名单：级联到合集内照片")
+        @DisplayName("viewer 合集白名单：级联到合集内照片（合集详情场景逐张判定零查询）")
         void viewerWithCollectionWhitelistCascades() {
             when(permMapper.selectList(any())).thenReturn(List.of(grant("W", "collection", 9L)));
-            when(collectionPhotoMapper.selectList(any())).thenReturn(List.of(relation(9L, 5L), relation(9L, 6L)));
-            User viewer = user("viewer", 0, 0);
+            User viewer = viewer();
 
-            assertThat(policy.canViewPhoto(viewer, photo(5L, 1))).isTrue();
-            assertThat(policy.canViewPhoto(viewer, photo(6L, 1))).isTrue();
-            assertThat(policy.canViewPhoto(viewer, photo(7L, 1))).isFalse();
+            assertThat(policy.canViewPhotoInCollection(viewer, photo(5L, 1), 9L)).isTrue();
+            assertThat(policy.canViewPhotoInCollection(viewer, photo(6L, 1), 9L)).isTrue();
+            assertThat(policy.canViewPhotoInCollection(viewer, photo(7L, 1), 10L)).isFalse();
             assertThat(policy.canViewCollection(viewer, collection(9L, 1, 1))).isTrue();
             assertThat(policy.canViewCollection(viewer, collection(10L, 1, 1))).isFalse();
+            verify(collectionPhotoMapper, never()).selectList(any());
+        }
+
+        @Test
+        @DisplayName("未知合集归属时：一次小查询确认照片是否属于被授权合集")
+        void shouldResolveCollectionMembershipWhenUnknown() {
+            when(permMapper.selectList(any())).thenReturn(List.of(grant("W", "collection", 9L)));
+            when(collectionPhotoMapper.selectCount(any())).thenReturn(1L);
+
+            assertThat(policy.canViewPhoto(viewer(), photo(5L, 1))).isTrue();
         }
 
         @Test
         @DisplayName("viewer global 白名单：全部私密可见")
         void viewerWithGlobalGrantSeesAllPrivate() {
             when(permMapper.selectList(any())).thenReturn(List.of(grant("W", "global", 0L)));
-            User viewer = user("viewer", 0, 0);
+            User viewer = viewer();
 
             assertThat(policy.photoScope(viewer).all()).isTrue();
             assertThat(policy.canViewPhoto(viewer, photo(123L, 1))).isTrue();
@@ -142,12 +161,12 @@ class AccessPolicyTest {
         void viewerWithGlobalGrantAndBlacklist() {
             when(permMapper.selectList(any())).thenReturn(Arrays.asList(
                     grant("W", "global", 0L), grant("B", "photo", 7L)));
-            User viewer = user("viewer", 0, 0);
+            User viewer = viewer();
 
             AccessPolicy.PrivateScope scope = policy.photoScope(viewer);
 
             assertThat(scope.all()).isTrue();
-            assertThat(scope.denied()).containsExactly(7L);
+            assertThat(scope.excludedPhotoIds()).containsExactly(7L);
             assertThat(policy.canViewPhoto(viewer, photo(7L, 1))).isFalse();
             assertThat(policy.canViewPhoto(viewer, photo(8L, 1))).isTrue();
         }
@@ -157,9 +176,47 @@ class AccessPolicyTest {
         void blacklistSubtractsFromWhitelist() {
             when(permMapper.selectList(any())).thenReturn(Arrays.asList(
                     grant("W", "photo", 5L), grant("B", "photo", 5L)));
-            User viewer = user("viewer", 0, 0);
+            User viewer = viewer();
 
             assertThat(policy.canViewPhoto(viewer, photo(5L, 1))).isFalse();
+        }
+
+        @Test
+        @DisplayName("分类白名单：该分类下的照片可见（服务端内存判定，无需展开照片 ID）")
+        void viewerWithCategoryWhitelist() {
+            when(permMapper.selectList(any())).thenReturn(List.of(grant("W", "category", 3L)));
+            User viewer = viewer();
+
+            Photo inCategory = photo(5L, 1);
+            inCategory.setCategoryId(3L);
+            Photo otherCategory = photo(6L, 1);
+            otherCategory.setCategoryId(4L);
+
+            assertThat(policy.canViewPhoto(viewer, inCategory)).isTrue();
+            assertThat(policy.canViewPhoto(viewer, otherCategory)).isFalse();
+        }
+
+        @Test
+        @DisplayName("合集内逐张判定：已知所属合集时不产生额外查询（合集详情批量场景）")
+        void inCollectionCheckNeedsNoQuery() {
+            when(permMapper.selectList(any())).thenReturn(List.of(grant("W", "collection", 9L)));
+            User viewer = viewer();
+            Photo privatePhoto = photo(5L, 1);
+
+            assertThat(policy.canViewPhotoInCollection(viewer, privatePhoto, 9L)).isTrue();
+            assertThat(policy.canViewPhotoInCollection(viewer, privatePhoto, 10L)).isFalse();
+
+            // 全程未查询合集内照片关系表（对比 canViewPhoto 的场景）
+            verify(collectionPhotoMapper, never()).selectCount(any());
+        }
+
+        @Test
+        @DisplayName("未被授予私密查看能力位的账号：即使有授权条目也看不到私密内容")
+        void capabilityIsRequired() {
+            User noCapability = user("viewer", 0, 0, 0);
+
+            assertThat(policy.photoScope(noCapability).all()).isFalse();
+            assertThat(policy.canViewPhoto(noCapability, photo(5L, 1))).isFalse();
         }
     }
 
@@ -185,7 +242,7 @@ class AccessPolicyTest {
         void viewerFilterRestrictsToPublic() {
             when(permMapper.selectList(any())).thenReturn(Collections.emptyList());
             LambdaQueryWrapper<Photo> wrapper = new LambdaQueryWrapper<>();
-            policy.applyPhotoFilter(wrapper, user("viewer", 0, 0));
+            policy.applyPhotoFilter(wrapper, viewer());
 
             assertThat(wrapper.getSqlSegment()).contains("is_private");
         }
@@ -197,6 +254,29 @@ class AccessPolicyTest {
             policy.applyCollectionFilter(wrapper, null);
 
             assertThat(wrapper.getSqlSegment()).contains("is_private");
+        }
+
+        @Test
+        @DisplayName("合集级授权以子查询表达，不把合集内照片 ID 展开成大 IN")
+        void collectionGrantUsesSubQuery() {
+            when(permMapper.selectList(any())).thenReturn(List.of(grant("W", "collection", 9L)));
+            LambdaQueryWrapper<Photo> wrapper = new LambdaQueryWrapper<>();
+            policy.applyPhotoFilter(wrapper, viewer());
+
+            String sql = wrapper.getSqlSegment();
+            assertThat(sql).contains("EXISTS");
+            assertThat(sql).contains("t_user_permission");
+            verify(collectionPhotoMapper, never()).selectList(any());
+        }
+
+        @Test
+        @DisplayName("分类级授权以子查询表达")
+        void categoryGrantUsesSubQuery() {
+            when(permMapper.selectList(any())).thenReturn(List.of(grant("W", "category", 3L)));
+            LambdaQueryWrapper<Photo> wrapper = new LambdaQueryWrapper<>();
+            policy.applyPhotoFilter(wrapper, viewer());
+
+            assertThat(wrapper.getSqlSegment()).contains("category_id IN (SELECT");
         }
     }
 
@@ -224,7 +304,7 @@ class AccessPolicyTest {
             when(permMapper.selectList(any())).thenReturn(Collections.emptyList());
             PhotoCollection privateCol = collection(4L, 1, 1);
 
-            assertThat(policy.canAccessCollection(user("viewer", 0, 0), privateCol)).isFalse();
+            assertThat(policy.canAccessCollection(viewer(), privateCol)).isFalse();
             assertThat(policy.canAccessCollection(null, privateCol)).isFalse();
         }
     }
@@ -234,13 +314,23 @@ class AccessPolicyTest {
     // ============================================================
 
     private User user(String role, Integer canUpload, Integer canManage) {
+        return user(role, canUpload, canManage, 0);
+    }
+
+    private User user(String role, Integer canUpload, Integer canManage, Integer canViewPrivate) {
         User user = new User();
         user.setId(100L);
         user.setUsername("tester");
         user.setRole(role);
         user.setCanUpload(canUpload);
         user.setCanManage(canManage);
+        user.setCanViewPrivate(canViewPrivate);
         return user;
+    }
+
+    /** 具备"私密查看"能力位的账号（角色仅为标识） */
+    private User viewer() {
+        return user("viewer", 0, 0, 1);
     }
 
     private UserPermission grant(String permType, String targetType, Long targetId) {

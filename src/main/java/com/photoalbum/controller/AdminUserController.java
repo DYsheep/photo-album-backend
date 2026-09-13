@@ -2,6 +2,7 @@ package com.photoalbum.controller;
 
 import com.photoalbum.common.BusinessException;
 import com.photoalbum.common.Result;
+import com.photoalbum.dto.UserUpsertDTO;
 import com.photoalbum.entity.User;
 import com.photoalbum.service.UserService;
 import lombok.RequiredArgsConstructor;
@@ -36,6 +37,7 @@ public class AdminUserController {
             m.put("role", u.getRole());
             m.put("canUpload", u.getCanUpload() != null ? u.getCanUpload() : 0);
             m.put("canManage", u.getCanManage() != null ? u.getCanManage() : 0);
+            m.put("canViewPrivate", u.getCanViewPrivate() != null ? u.getCanViewPrivate() : 0);
             m.put("createdAt", u.getCreatedAt());
             result.add(m);
         }
@@ -46,11 +48,7 @@ public class AdminUserController {
     @PostMapping
     public Result<Map<String, Object>> create(@RequestBody Map<String, String> body) {
         try {
-            User u = userService.createUser(
-                    body.get("username"), body.get("password"),
-                    body.get("nickname"), body.get("role"),
-                    parseIntOrNull(body.get("canUpload")),
-                    parseIntOrNull(body.get("canManage")));
+            User u = userService.createUser(buildUpsert(body, true));
             Map<String, Object> m = new HashMap<>();
             m.put("id", u.getId());
             m.put("username", u.getUsername());
@@ -65,8 +63,7 @@ public class AdminUserController {
     @PutMapping("/{id}")
     public Result<Void> update(@PathVariable Long id, @RequestBody Map<String, String> body) {
         try {
-            userService.updateUser(id, body.get("nickname"), body.get("role"), body.get("password"),
-                    parseIntOrNull(body.get("canUpload")), parseIntOrNull(body.get("canManage")));
+            userService.updateUser(id, buildUpsert(body, false));
             return Result.ok();
         } catch (BusinessException e) {
             return Result.fail(e.getCode(), e.getMessage());
@@ -90,6 +87,19 @@ public class AdminUserController {
         return Result.ok(userService.getUserPermissions(id));
     }
 
+    /**
+     * 以该账号视角预览可见范围（用于核对授权配置，避免"配完不知道生效没有"）
+     * GET /api/admin/users/{id}/preview
+     */
+    @GetMapping("/{id}/preview")
+    public Result<Map<String, Object>> preview(@PathVariable Long id) {
+        try {
+            return Result.ok(userService.previewVisibility(id));
+        } catch (BusinessException e) {
+            return Result.fail(e.getCode(), e.getMessage());
+        }
+    }
+
     /** 添加权限条目 */
     @PostMapping("/{id}/permissions")
     public Result<Void> addPermission(@PathVariable Long id, @RequestBody Map<String, String> body) {
@@ -107,6 +117,22 @@ public class AdminUserController {
     public Result<Void> removePermission(@PathVariable Long id, @PathVariable Long permId) {
         userService.removePermission(permId);
         return Result.ok();
+    }
+
+    private UserUpsertDTO buildUpsert(Map<String, String> body, boolean creating) {
+        UserUpsertDTO dto = new UserUpsertDTO();
+        dto.setUsername(body.get("username"));
+        dto.setPassword(body.get("password"));
+        dto.setNickname(body.get("nickname"));
+        dto.setRole(body.get("role"));
+        dto.setCanUpload(parseIntOrNull(body.get("canUpload")));
+        dto.setCanManage(parseIntOrNull(body.get("canManage")));
+        dto.setCanViewPrivate(parseIntOrNull(body.get("canViewPrivate")));
+        if (!creating) {
+            // 更新时不带用户名（不可改）
+            dto.setUsername(null);
+        }
+        return dto;
     }
 
     private Integer parseIntOrNull(String s) {
