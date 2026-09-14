@@ -10,7 +10,6 @@ import com.photoalbum.mapper.CategoryMapper;
 import com.photoalbum.mapper.PhotoCollectionPhotoMapper;
 import com.photoalbum.mapper.PhotoMapper;
 import com.photoalbum.mapper.ShareLinkMapper;
-import com.photoalbum.mapper.UserPermissionMapper;
 import com.photoalbum.security.AccessPolicy;
 import com.photoalbum.service.PhotoUrlResolver;
 import com.photoalbum.service.TagService;
@@ -54,8 +53,6 @@ class PhotoServiceTest {
     @Mock
     private ShareLinkMapper shareLinkMapper;
 
-    @Mock
-    private UserPermissionMapper permMapper;
 
     /** 可见性策略由 AccessPolicyTest 单独覆盖，此处仅需注入以保证调用链完整 */
     @Mock

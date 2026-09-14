@@ -369,4 +369,30 @@ class AccessPolicyTest {
         relation.setPhotoId(photoId);
         return relation;
     }
+
+    @Nested
+    @DisplayName("授权子查询列名回归（元组化后不得再引用旧表/旧列）")
+    class SubQueryColumnRegressionTests {
+
+        @Test
+        @DisplayName("带 allow/deny 条目的访客：生成的 SQL 只引用 t_auth_tuple 的新列名")
+        void generatedSqlUsesTupleColumnsOnly() {
+            when(tupleMapper.selectList(any())).thenReturn(List.of(
+                    grant("W", "collection", 8L),
+                    grant("B", "collection", 5L),
+                    grant("B", "category", 2L)));
+
+            LambdaQueryWrapper<Photo> wrapper = new LambdaQueryWrapper<>();
+            policy.applyPhotoFilter(wrapper, viewer());
+            String sql = wrapper.getSqlSegment();
+
+            assertThat(sql).contains("t_auth_tuple");
+            assertThat(sql).contains("subject_id");
+            assertThat(sql).doesNotContain("t_user_permission");
+            assertThat(sql).doesNotContain("user_id");
+            assertThat(sql).doesNotContain("perm_type");
+            assertThat(sql).doesNotContain("target_type");
+            assertThat(sql).doesNotContain("target_id");
+        }
+    }
 }
