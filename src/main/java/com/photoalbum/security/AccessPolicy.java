@@ -46,6 +46,12 @@ public class AccessPolicy {
     private static final String CACHE_KEY_PREFIX = "photo-album:access-scope:";
 
     private final com.photoalbum.mapper.AuthTupleMapper tupleMapper;
+    private final com.photoalbum.mapper.RoleTemplateMapper roleTemplateMapper;
+
+    /** 数据范围：全站（仍扣 deny） */
+    public static final String SCOPE_ALL = "ALL";
+    /** 数据范围：自己创建的 + 被授予的 */
+    public static final String SCOPE_OWN_AND_GRANTED = "OWN_AND_GRANTED";
     private final PhotoCollectionPhotoMapper collectionPhotoMapper;
     private final com.photoalbum.mapper.CollectionMemberMapper collectionMemberMapper;
     private final com.photoalbum.mapper.TagMapper tagMapper;
@@ -384,20 +390,101 @@ public class AccessPolicy {
         if (collection == null) {
             return false;
         }
-        if (UserAuthorities.hasManageAccess(user)) {
-            return true;
-        }
-        if (user != null && user.getId() != null && collection.getId() != null
-                && collectionMemberMapper.selectCount(
-                        new com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper<com.photoalbum.entity.CollectionMember>()
-                                .eq(com.photoalbum.entity.CollectionMember::getCollectionId, collection.getId())
-                                .eq(com.photoalbum.entity.CollectionMember::getUserId, user.getId())) > 0) {
+        if (canManageCollection(user, collection)) {
             return true;
         }
         if (collection.getIsPublished() == null || collection.getIsPublished() != 1) {
             return false;
         }
         return canViewCollection(user, collection);
+    }
+
+
+    // ========== 数据范围（管理侧） ==========
+
+    /** 该账号的数据范围：admin 为 ALL，其余按角色模板取（未配置时按最保守范围） */
+    public String dataScopeOf(User user) {
+        if (UserRoles.isAdmin(user == null ? null : user.getRole())) {
+            return SCOPE_ALL;
+        }
+        if (user == null || user.getRole() == null) {
+            return SCOPE_OWN_AND_GRANTED;
+        }
+        String scope = roleTemplateMapper.selectDataScope(user.getRole());
+        return SCOPE_ALL.equals(scope) ? SCOPE_ALL : SCOPE_OWN_AND_GRANTED;
+    }
+
+    /** 是否被显式禁止访问该合集（deny 优先于一切，包括管理员） */
+    public boolean isCollectionDenied(User user, Long collectionId) {
+        return user != null && collectionId != null
+                && collectionScope(user).excludedCollectionIds().contains(collectionId);
+    }
+
+    /**
+     * 管理侧合集可见条件：数据范围 − 禁止项
+     *
+     * ALL            → 全站合集，扣除被 deny 的合集
+     * OWN_AND_GRANTED→ 自己创建的 + 协作者 + 被显式允许的合集，扣除被 deny 的合集
+     */
+    public void applyManagedCollectionFilter(LambdaQueryWrapper<PhotoCollection> wrapper, User user) {
+        if (user == null) {
+            wrapper.eq(PhotoCollection::getId, -1L);
+            return;
+        }
+        Set<Long> denied = collectionScope(user).excludedCollectionIds();
+        Set<Long> allowed = collectionScope(user).allowedCollectionIds();
+
+        if (!SCOPE_ALL.equals(dataScopeOf(user))) {
+            Set<Long> memberIds = new LinkedHashSet<>();
+            collectionMemberMapper.selectList(new LambdaQueryWrapper<com.photoalbum.entity.CollectionMember>()
+                            .eq(com.photoalbum.entity.CollectionMember::getUserId, user.getId()))
+                    .forEach(m -> memberIds.add(m.getCollectionId()));
+            Set<Long> ownOrGranted = new LinkedHashSet<>(allowed);
+            ownOrGranted.addAll(memberIds);
+            wrapper.and(w -> {
+                w.eq(PhotoCollection::getCreatedBy, user.getId());
+                if (!ownOrGranted.isEmpty()) {
+                    w.or().in(PhotoCollection::getId, ownOrGranted);
+                }
+            });
+        }
+        if (!denied.isEmpty()) {
+            wrapper.notIn(PhotoCollection::getId, denied);
+        }
+    }
+
+    /** 管理侧单合集判定（详情与写操作共用；不可见即不可管理） */
+    public boolean canManageCollection(User user, PhotoCollection collection) {
+        if (collection == null || user == null) {
+            return false;
+        }
+        if (isCollectionDenied(user, collection.getId())) {
+            return false;
+        }
+        if (SCOPE_ALL.equals(dataScopeOf(user))) {
+            return true;
+        }
+        if (collection.getCreatedBy() != null && collection.getCreatedBy().equals(user.getId())) {
+            return true;
+        }
+        if (collectionScope(user).allowedCollectionIds().contains(collection.getId())) {
+            return true;
+        }
+        return collectionMemberMapper.selectCount(new LambdaQueryWrapper<com.photoalbum.entity.CollectionMember>()
+                .eq(com.photoalbum.entity.CollectionMember::getCollectionId, collection.getId())
+                .eq(com.photoalbum.entity.CollectionMember::getUserId, user.getId())) > 0;
+    }
+
+    /**
+     * "对当前调用者可见的照片"SQL 条件（不含 WHERE）
+     *
+     * 计数、统计、标签/分类聚合等派生数据统一复用它，避免口径不一致造成存在性泄露。
+     */
+    public String visiblePhotoCondition(User user) {
+        LambdaQueryWrapper<Photo> wrapper = new LambdaQueryWrapper<>();
+        applyPhotoFilter(wrapper, user);
+        String segment = wrapper.getSqlSegment();
+        return (segment == null || segment.isBlank()) ? "1 = 1" : segment;
     }
 
     // ========== 内部工具 ==========

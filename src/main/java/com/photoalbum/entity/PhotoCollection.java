@@ -27,6 +27,8 @@ public class PhotoCollection {
 
     private Integer isPrivate;       // 是否私密（0=公开 1=私密）
 
+    private Long createdBy;   // 创建人（数据范围 OWN 判定）
+
     @TableField(fill = FieldFill.INSERT)
     private LocalDateTime createdAt;
 

@@ -112,6 +112,13 @@ public class PhotoServiceImpl extends ServiceImpl<PhotoMapper, Photo> implements
         return CurrentUserSupport.getCurrentUser();
     }
 
+    /** 可见范围内的照片查询条件（计数/统计/标签聚合统一复用，保证口径一致） */
+    private LambdaQueryWrapper<Photo> visiblePhotoWrapper() {
+        LambdaQueryWrapper<Photo> wrapper = new LambdaQueryWrapper<>();
+        accessPolicy.applyPhotoFilter(wrapper, getCurrentUser());
+        return wrapper;
+    }
+
     /**
      * 分页查询
      */
@@ -386,7 +393,7 @@ public class PhotoServiceImpl extends ServiceImpl<PhotoMapper, Photo> implements
         Map<String, Object> data = new HashMap<>();
 
         // 照片总数
-        long totalPhotos = photoMapper.selectCount(null);
+        long totalPhotos = photoMapper.selectCount(visiblePhotoWrapper());
         data.put("totalPhotos", totalPhotos);
 
         // 分类数量
@@ -394,7 +401,7 @@ public class PhotoServiceImpl extends ServiceImpl<PhotoMapper, Photo> implements
         data.put("totalCategories", totalCategories);
 
         // 总浏览量
-        List<Photo> allPhotos = photoMapper.selectList(null);
+        List<Photo> allPhotos = photoMapper.selectList(visiblePhotoWrapper());
         int totalViews = allPhotos.stream()
                 .mapToInt(p -> p.getViewCount() != null ? p.getViewCount() : 0)
                 .sum();

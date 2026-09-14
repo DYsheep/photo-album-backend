@@ -50,6 +50,10 @@ class AccessPolicyTest {
     @Mock
     private com.photoalbum.mapper.TagMapper tagMapper;
 
+    /** 角色模板（数据范围） */
+    @Mock
+    private com.photoalbum.mapper.RoleTemplateMapper roleTemplateMapper;
+
     @InjectMocks
     private AccessPolicy policy;
 
@@ -289,13 +293,14 @@ class AccessPolicyTest {
     class CollectionAccessTests {
 
         @Test
-        @DisplayName("未发布草稿：访客不可访问，具备管理权限的账号可访问")
+        @DisplayName("未发布草稿：仅管理员与资源范围内账号可访问")
         void draftCollectionOnlyForManagers() {
             PhotoCollection draft = collection(3L, 0, 0);
 
             assertThat(policy.canAccessCollection(null, draft)).isFalse();
             assertThat(policy.canAccessCollection(user("admin", 0, 0), draft)).isTrue();
-            assertThat(policy.canAccessCollection(user("user", 0, 1), draft)).isTrue();
+            // 决策点 1B：具备管理能力但既非创建人、也未被授予/指派时，草稿不可见
+            assertThat(policy.canAccessCollection(user("user", 0, 1), draft)).isFalse();
         }
 
         @Test

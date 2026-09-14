@@ -121,29 +121,20 @@ public class CollectionServiceImpl implements CollectionService {
     @Override
     public List<CollectionDTO> getAllCollections() {
         LambdaQueryWrapper<PhotoCollection> wrapper = new LambdaQueryWrapper<>();
+        // 数据范围（全站 / 自己创建+被授予）− 禁止项，统一由策略判定：
+        // 不再按"有无管理能力"放行，被 deny 的合集对任何账号都不出现
+        accessPolicy.applyManagedCollectionFilter(wrapper, getCurrentUser());
         wrapper.orderByAsc(PhotoCollection::getSortOrder)
                 .orderByDesc(PhotoCollection::getCreatedAt);
-        List<PhotoCollection> list = collectionMapper.selectList(wrapper);
+        return collectionMapper.selectList(wrapper).stream().map(this::toDTO).collect(Collectors.toList());
+    }
 
-        User user = getCurrentUser();
-        if (user == null) {
-            return List.of();
-        }
-        // 具备内容管理权限：可见全部合集（含未发布草稿）
-        if (UserAuthorities.hasManageAccess(user)) {
-            return list.stream().map(this::toDTO).collect(Collectors.toList());
-        }
-        // 非管理者（协作者）：只返回被指派负责的合集
-        Set<Long> memberCollectionIds = memberMapper.selectList(
-                        new LambdaQueryWrapper<CollectionMember>().eq(CollectionMember::getUserId, user.getId()))
-                .stream().map(CollectionMember::getCollectionId).collect(Collectors.toSet());
-        if (memberCollectionIds.isEmpty()) {
-            return List.of();
-        }
-        return list.stream()
-                .filter(c -> memberCollectionIds.contains(c.getId()))
-                .map(this::toDTO)
-                .collect(Collectors.toList());
+    /** 合集内对当前调用者可见的照片数（与照片列表同一判定入口，避免暴露隐藏照片数量） */
+    private int countVisiblePhotos(Long collectionId) {
+        LambdaQueryWrapper<Photo> wrapper = new LambdaQueryWrapper<Photo>()
+                .inSql(Photo::getId, "SELECT photo_id FROM t_collection_photos WHERE collection_id = " + collectionId);
+        accessPolicy.applyPhotoFilter(wrapper, getCurrentUser());
+        return photoMapper.selectCount(wrapper).intValue();
     }
 
     @Override
@@ -242,6 +233,10 @@ public class CollectionServiceImpl implements CollectionService {
         collection.setIsPublished(dto.getIsPublished() != null ? dto.getIsPublished() : 1);
         collection.setCreatedAt(LocalDateTime.now());
         collection.setUpdatedAt(LocalDateTime.now());
+        User creator = getCurrentUser();
+        if (creator != null) {
+            collection.setCreatedBy(creator.getId());
+        }
         collectionMapper.insert(collection);
         return toDTO(collection);
     }
@@ -319,7 +314,7 @@ public class CollectionServiceImpl implements CollectionService {
         // 统计照片数
         LambdaQueryWrapper<PhotoCollectionPhoto> wrapper = new LambdaQueryWrapper<>();
         wrapper.eq(PhotoCollectionPhoto::getCollectionId, collection.getId());
-        dto.setPhotoCount(collectionPhotoMapper.selectCount(wrapper).intValue());
+        dto.setPhotoCount(countVisiblePhotos(collection.getId()));
         // 封面 URL（没设封面时用合集第一张照片）
         if (collection.getCoverPhotoId() != null) {
             Photo cover = photoMapper.selectById(collection.getCoverPhotoId());

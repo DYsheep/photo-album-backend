@@ -520,9 +520,9 @@ class PhotoServiceTest {
             Category cat1 = new Category(); cat1.setId(1L); cat1.setName("风景");
             Category cat2 = new Category(); cat2.setId(2L); cat2.setName("人像");
 
-            when(photoMapper.selectCount(null)).thenReturn(3L);
+            when(photoMapper.selectCount(any())).thenReturn(3L);
             when(categoryMapper.selectCount(null)).thenReturn(2L);
-            when(photoMapper.selectList(null)).thenReturn(Arrays.asList(p1, p2, p3));
+            when(photoMapper.selectList(any())).thenReturn(Arrays.asList(p1, p2, p3));
             when(photoMapper.selectList(any(LambdaQueryWrapper.class))).thenReturn(Arrays.asList(p1, p2, p3));
             when(categoryMapper.selectById(1L)).thenReturn(cat1);
             when(categoryMapper.selectById(2L)).thenReturn(cat2);
@@ -547,9 +547,9 @@ class PhotoServiceTest {
         @Test
         @DisplayName("无数据时，各项统计应为零")
         void shouldReturnZeroStatsWhenEmpty() {
-            when(photoMapper.selectCount(null)).thenReturn(0L);
+            when(photoMapper.selectCount(any())).thenReturn(0L);
             when(categoryMapper.selectCount(null)).thenReturn(0L);
-            when(photoMapper.selectList(null)).thenReturn(Collections.emptyList());
+            when(photoMapper.selectList(any())).thenReturn(Collections.emptyList());
             when(photoMapper.selectList(any(LambdaQueryWrapper.class))).thenReturn(Collections.emptyList());
 
             Map<String, Object> stats = photoService.getDashboardStats();
@@ -848,7 +848,7 @@ class PhotoServiceTest {
             p2.setIso("400");
             p2.setDateTaken("2024:06:20 10:00:00");
 
-            when(photoMapper.selectCount(isNull())).thenReturn(2L);
+            when(photoMapper.selectCount(any())).thenReturn(2L);
             when(categoryMapper.selectCount(isNull())).thenReturn(1L);
             when(photoMapper.selectList(isNull())).thenReturn(Arrays.asList(p1, p2));
             when(photoMapper.selectList(any(LambdaQueryWrapper.class))).thenReturn(Arrays.asList(p1, p2));
@@ -910,7 +910,7 @@ class PhotoServiceTest {
             photo.setIso("");
             photo.setDateTaken("");
 
-            when(photoMapper.selectCount(isNull())).thenReturn(1L);
+            when(photoMapper.selectCount(any())).thenReturn(1L);
             when(categoryMapper.selectCount(isNull())).thenReturn(1L);
             when(photoMapper.selectList(isNull())).thenReturn(Arrays.asList(photo));
             when(photoMapper.selectList(any(LambdaQueryWrapper.class))).thenReturn(Arrays.asList(photo));
