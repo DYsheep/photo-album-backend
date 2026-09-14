@@ -245,7 +245,7 @@ public class AccessPolicy {
             grants.add("id IN (" + joinIds(scope.allowedPhotoIds()) + ")");
         }
         if (!scope.allowedCategoryIds().isEmpty()) {
-            grants.add("category_id IN (SELECT object_id FROM t_auth_tuple WHERE user_id = " + user.getId()
+            grants.add("category_id IN (SELECT object_id FROM t_auth_tuple WHERE subject_type = 'user' AND subject_id = " + user.getId()
                     + " AND relation = '" + com.photoalbum.entity.AuthTuple.RELATION_ALLOW + "' AND object_type = '"
                     + PermissionConstants.TARGET_CATEGORY + "')");
         }
@@ -271,7 +271,7 @@ public class AccessPolicy {
         }
         if (!scope.excludedCategoryIds().isEmpty()) {
             // category_id 可能为 NULL，NOT IN 对 NULL 返回 UNKNOWN 会把无分类的照片一并排除，需显式放行
-            exclusions.add("(category_id IS NULL OR category_id NOT IN (SELECT object_id FROM t_auth_tuple WHERE user_id = "
+            exclusions.add("(category_id IS NULL OR category_id NOT IN (SELECT object_id FROM t_auth_tuple WHERE subject_type = 'user' AND subject_id = "
                     + user.getId() + " AND relation = '" + com.photoalbum.entity.AuthTuple.RELATION_DENY + "' AND object_type = '"
                     + PermissionConstants.TARGET_CATEGORY + "'))");
         }
@@ -290,7 +290,7 @@ public class AccessPolicy {
     private String tagSubQuery(Long userId, String permType) {
         return "EXISTS (SELECT 1 FROM t_photo_tag pt"
                 + " JOIN t_auth_tuple up ON up.object_id = pt.tag_id"
-                + " AND up.user_id = " + userId
+                + " AND up.subject_type = 'user' AND up.subject_id = " + userId
                 + " AND up.relation = '" + permType + "'"
                 + " AND up.object_type = '" + PermissionConstants.TARGET_TAG + "'"
                 + " WHERE pt.photo_id = t_photo.id)";
@@ -302,7 +302,7 @@ public class AccessPolicy {
     private String collectionSubQuery(Long userId, String permType) {
         return "EXISTS (SELECT 1 FROM t_collection_photos cp"
                 + " JOIN t_auth_tuple up ON up.object_id = cp.collection_id"
-                + " AND up.user_id = " + userId
+                + " AND up.subject_type = 'user' AND up.subject_id = " + userId
                 + " AND up.relation = '" + permType + "'"
                 + " AND up.object_type = '" + PermissionConstants.TARGET_COLLECTION + "'"
                 + " WHERE cp.photo_id = t_photo.id)";
