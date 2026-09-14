@@ -244,10 +244,8 @@ public class CollectionServiceImpl implements CollectionService {
     @Override
     @Transactional
     public CollectionDTO updateCollection(Long id, CollectionDTO dto) {
-        PhotoCollection collection = collectionMapper.selectById(id);
-        if (collection == null) {
-            throw new BusinessException("合集不存在");
-        }
+        // 资源级判定：不可见即不可管理，按"不存在"处理（避免通过响应差异推断资源存在性）
+        PhotoCollection collection = requireAccessibleCollection(id);
         if (dto.getName() != null) collection.setName(dto.getName());
         if (dto.getDescription() != null) collection.setDescription(dto.getDescription());
         if (dto.getCoverPhotoId() != null) collection.setCoverPhotoId(dto.getCoverPhotoId());
@@ -262,10 +260,8 @@ public class CollectionServiceImpl implements CollectionService {
     @Override
     @Transactional
     public void deleteCollection(Long id) {
-        PhotoCollection collection = collectionMapper.selectById(id);
-        if (collection == null) {
-            throw new BusinessException("合集不存在");
-        }
+        // 资源级判定：不可见即不可管理，按"不存在"处理
+        requireAccessibleCollection(id);
         LambdaQueryWrapper<PhotoCollectionPhoto> wrapper = new LambdaQueryWrapper<>();
         wrapper.eq(PhotoCollectionPhoto::getCollectionId, id);
         collectionPhotoMapper.delete(wrapper);
@@ -275,9 +271,11 @@ public class CollectionServiceImpl implements CollectionService {
     @Override
     @Transactional
     public void addPhoto(Long collectionId, Long photoId) {
-        PhotoCollection collection = collectionMapper.selectById(collectionId);
-        if (collection == null) {
-            throw new BusinessException("合集不存在");
+        // 资源级判定：不可见即不可管理（合集与照片都要在调用者可见范围内）
+        requireAccessibleCollection(collectionId);
+        com.photoalbum.entity.Photo target = photoMapper.selectById(photoId);
+        if (target == null || !accessPolicy.canViewPhoto(getCurrentUser(), target)) {
+            throw new BusinessException(404, "照片不存在");
         }
         LambdaQueryWrapper<PhotoCollectionPhoto> qw = new LambdaQueryWrapper<>();
         qw.eq(PhotoCollectionPhoto::getCollectionId, collectionId)
@@ -296,6 +294,8 @@ public class CollectionServiceImpl implements CollectionService {
     @Override
     @Transactional
     public void removePhoto(Long collectionId, Long photoId) {
+        // 资源级判定：不可见即不可管理
+        requireAccessibleCollection(collectionId);
         LambdaQueryWrapper<PhotoCollectionPhoto> wrapper = new LambdaQueryWrapper<>();
         wrapper.eq(PhotoCollectionPhoto::getCollectionId, collectionId)
                 .eq(PhotoCollectionPhoto::getPhotoId, photoId);
