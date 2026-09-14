@@ -7,9 +7,7 @@ import com.photoalbum.entity.Photo;
 import com.photoalbum.entity.PhotoCollection;
 import com.photoalbum.entity.PhotoCollectionPhoto;
 import com.photoalbum.entity.User;
-import com.photoalbum.entity.UserPermission;
 import com.photoalbum.mapper.PhotoCollectionPhotoMapper;
-import com.photoalbum.mapper.UserPermissionMapper;
 import lombok.RequiredArgsConstructor;
 import org.springframework.stereotype.Component;
 import org.springframework.web.context.request.RequestAttributes;
@@ -28,7 +26,7 @@ import java.util.stream.Collectors;
  * 判定模型（默认拒绝）：
  *   1. admin：全部可见；
  *   2. 不具备"私密查看能力"的账号：任何私密内容都不可见；
- *   3. 具备能力的账号：由 t_user_permission 决定 ——
+ *   3. 具备能力的账号：由 t_auth_tuple 决定 ——
  *        · 白名单（W）定义可见范围：global=全部私密；photo/collection/category=指定对象
  *          （collection 级联到合集内照片，category 级联到该分类下的照片）
  *        · 黑名单（B）在上述范围内做排除
@@ -47,7 +45,7 @@ public class AccessPolicy {
     /** 请求级缓存键前缀 */
     private static final String CACHE_KEY_PREFIX = "photo-album:access-scope:";
 
-    private final UserPermissionMapper permMapper;
+    private final com.photoalbum.mapper.AuthTupleMapper tupleMapper;
     private final PhotoCollectionPhotoMapper collectionPhotoMapper;
     private final com.photoalbum.mapper.CollectionMemberMapper collectionMemberMapper;
     private final com.photoalbum.mapper.TagMapper tagMapper;
@@ -117,22 +115,22 @@ public class AccessPolicy {
         if (!UserAuthorities.mayViewPrivate(user) || user == null) {
             return PrivateScope.none();
         }
-        List<UserPermission> grants = grantsOf(user.getId());
+        List<com.photoalbum.entity.AuthTuple> grants = grantsOf(user.getId());
         if (grants.isEmpty()) {
             return PrivateScope.none();
         }
-        Set<Long> allowedTagIds = targetIds(grants, PermissionConstants.TYPE_WHITELIST, PermissionConstants.TARGET_TAG);
-        Set<Long> excludedTagIds = targetIds(grants, PermissionConstants.TYPE_BLACKLIST, PermissionConstants.TARGET_TAG);
+        Set<Long> allowedTagIds = targetIds(grants, com.photoalbum.entity.AuthTuple.RELATION_ALLOW, PermissionConstants.TARGET_TAG);
+        Set<Long> excludedTagIds = targetIds(grants, com.photoalbum.entity.AuthTuple.RELATION_DENY, PermissionConstants.TARGET_TAG);
         return new PrivateScope(
                 hasGlobalWhitelist(grants),
-                targetIds(grants, PermissionConstants.TYPE_WHITELIST, PermissionConstants.TARGET_PHOTO),
-                targetIds(grants, PermissionConstants.TYPE_WHITELIST, PermissionConstants.TARGET_COLLECTION),
-                targetIds(grants, PermissionConstants.TYPE_WHITELIST, PermissionConstants.TARGET_CATEGORY),
+                targetIds(grants, com.photoalbum.entity.AuthTuple.RELATION_ALLOW, PermissionConstants.TARGET_PHOTO),
+                targetIds(grants, com.photoalbum.entity.AuthTuple.RELATION_ALLOW, PermissionConstants.TARGET_COLLECTION),
+                targetIds(grants, com.photoalbum.entity.AuthTuple.RELATION_ALLOW, PermissionConstants.TARGET_CATEGORY),
                 allowedTagIds,
                 namesOfTags(allowedTagIds),
-                targetIds(grants, PermissionConstants.TYPE_BLACKLIST, PermissionConstants.TARGET_PHOTO),
-                targetIds(grants, PermissionConstants.TYPE_BLACKLIST, PermissionConstants.TARGET_COLLECTION),
-                targetIds(grants, PermissionConstants.TYPE_BLACKLIST, PermissionConstants.TARGET_CATEGORY),
+                targetIds(grants, com.photoalbum.entity.AuthTuple.RELATION_DENY, PermissionConstants.TARGET_PHOTO),
+                targetIds(grants, com.photoalbum.entity.AuthTuple.RELATION_DENY, PermissionConstants.TARGET_COLLECTION),
+                targetIds(grants, com.photoalbum.entity.AuthTuple.RELATION_DENY, PermissionConstants.TARGET_CATEGORY),
                 excludedTagIds,
                 namesOfTags(excludedTagIds));
     }
@@ -144,17 +142,17 @@ public class AccessPolicy {
         if (!UserAuthorities.mayViewPrivate(user) || user == null) {
             return PrivateScope.none();
         }
-        List<UserPermission> grants = grantsOf(user.getId());
+        List<com.photoalbum.entity.AuthTuple> grants = grantsOf(user.getId());
         if (grants.isEmpty()) {
             return PrivateScope.none();
         }
         return new PrivateScope(
                 hasGlobalWhitelist(grants),
                 Set.of(),
-                targetIds(grants, PermissionConstants.TYPE_WHITELIST, PermissionConstants.TARGET_COLLECTION),
+                targetIds(grants, com.photoalbum.entity.AuthTuple.RELATION_ALLOW, PermissionConstants.TARGET_COLLECTION),
                 Set.of(), Set.of(), Set.of(),
                 Set.of(),
-                targetIds(grants, PermissionConstants.TYPE_BLACKLIST, PermissionConstants.TARGET_COLLECTION),
+                targetIds(grants, com.photoalbum.entity.AuthTuple.RELATION_DENY, PermissionConstants.TARGET_COLLECTION),
                 Set.of(), Set.of(), Set.of());
     }
 
@@ -176,8 +174,8 @@ public class AccessPolicy {
      * 生成的私密条件形如：
      *   is_private = 0
      *   OR (is_private = 1 AND ( id IN (照片白名单…)
-     *         OR category_id IN (SELECT target_id FROM t_user_permission WHERE …'category')
-     *         OR EXISTS (SELECT 1 FROM t_collection_photos cp JOIN t_user_permission up …) ))
+     *         OR category_id IN (SELECT object_id FROM t_auth_tuple WHERE …'category')
+     *         OR EXISTS (SELECT 1 FROM t_collection_photos cp JOIN t_auth_tuple up …) ))
      */
     public void applyPhotoFilter(LambdaQueryWrapper<Photo> wrapper, User user) {
         PrivateScope scope = photoScope(user);
@@ -241,15 +239,15 @@ public class AccessPolicy {
             grants.add("id IN (" + joinIds(scope.allowedPhotoIds()) + ")");
         }
         if (!scope.allowedCategoryIds().isEmpty()) {
-            grants.add("category_id IN (SELECT target_id FROM t_user_permission WHERE user_id = " + user.getId()
-                    + " AND perm_type = '" + PermissionConstants.TYPE_WHITELIST + "' AND target_type = '"
+            grants.add("category_id IN (SELECT object_id FROM t_auth_tuple WHERE user_id = " + user.getId()
+                    + " AND relation = '" + com.photoalbum.entity.AuthTuple.RELATION_ALLOW + "' AND object_type = '"
                     + PermissionConstants.TARGET_CATEGORY + "')");
         }
         if (!scope.allowedCollectionIds().isEmpty()) {
-            grants.add(collectionSubQuery(user.getId(), PermissionConstants.TYPE_WHITELIST));
+            grants.add(collectionSubQuery(user.getId(), com.photoalbum.entity.AuthTuple.RELATION_ALLOW));
         }
         if (!scope.allowedTagIds().isEmpty()) {
-            grants.add(tagSubQuery(user.getId(), PermissionConstants.TYPE_WHITELIST));
+            grants.add(tagSubQuery(user.getId(), com.photoalbum.entity.AuthTuple.RELATION_ALLOW));
         }
         String condition = "is_private = 1 AND (" + String.join(" OR ", grants) + ")";
         List<String> exclusions = exclusionSql(scope, user);
@@ -267,15 +265,15 @@ public class AccessPolicy {
         }
         if (!scope.excludedCategoryIds().isEmpty()) {
             // category_id 可能为 NULL，NOT IN 对 NULL 返回 UNKNOWN 会把无分类的照片一并排除，需显式放行
-            exclusions.add("(category_id IS NULL OR category_id NOT IN (SELECT target_id FROM t_user_permission WHERE user_id = "
-                    + user.getId() + " AND perm_type = '" + PermissionConstants.TYPE_BLACKLIST + "' AND target_type = '"
+            exclusions.add("(category_id IS NULL OR category_id NOT IN (SELECT object_id FROM t_auth_tuple WHERE user_id = "
+                    + user.getId() + " AND relation = '" + com.photoalbum.entity.AuthTuple.RELATION_DENY + "' AND object_type = '"
                     + PermissionConstants.TARGET_CATEGORY + "'))");
         }
         if (!scope.excludedCollectionIds().isEmpty()) {
-            exclusions.add("NOT " + collectionSubQuery(user.getId(), PermissionConstants.TYPE_BLACKLIST));
+            exclusions.add("NOT " + collectionSubQuery(user.getId(), com.photoalbum.entity.AuthTuple.RELATION_DENY));
         }
         if (!scope.excludedTagIds().isEmpty()) {
-            exclusions.add("NOT " + tagSubQuery(user.getId(), PermissionConstants.TYPE_BLACKLIST));
+            exclusions.add("NOT " + tagSubQuery(user.getId(), com.photoalbum.entity.AuthTuple.RELATION_DENY));
         }
         return exclusions;
     }
@@ -285,10 +283,10 @@ public class AccessPolicy {
      */
     private String tagSubQuery(Long userId, String permType) {
         return "EXISTS (SELECT 1 FROM t_photo_tag pt"
-                + " JOIN t_user_permission up ON up.target_id = pt.tag_id"
+                + " JOIN t_auth_tuple up ON up.object_id = pt.tag_id"
                 + " AND up.user_id = " + userId
-                + " AND up.perm_type = '" + permType + "'"
-                + " AND up.target_type = '" + PermissionConstants.TARGET_TAG + "'"
+                + " AND up.relation = '" + permType + "'"
+                + " AND up.object_type = '" + PermissionConstants.TARGET_TAG + "'"
                 + " WHERE pt.photo_id = t_photo.id)";
     }
 
@@ -297,10 +295,10 @@ public class AccessPolicy {
      */
     private String collectionSubQuery(Long userId, String permType) {
         return "EXISTS (SELECT 1 FROM t_collection_photos cp"
-                + " JOIN t_user_permission up ON up.target_id = cp.collection_id"
+                + " JOIN t_auth_tuple up ON up.object_id = cp.collection_id"
                 + " AND up.user_id = " + userId
-                + " AND up.perm_type = '" + permType + "'"
-                + " AND up.target_type = '" + PermissionConstants.TARGET_COLLECTION + "'"
+                + " AND up.relation = '" + permType + "'"
+                + " AND up.object_type = '" + PermissionConstants.TARGET_COLLECTION + "'"
                 + " WHERE cp.photo_id = t_photo.id)";
     }
 
@@ -461,28 +459,30 @@ public class AccessPolicy {
                 .in(PhotoCollectionPhoto::getCollectionId, collectionIds)) > 0;
     }
 
-    private List<UserPermission> grantsOf(Long userId) {
+    private List<com.photoalbum.entity.AuthTuple> grantsOf(Long userId) {
         if (userId == null) {
             return List.of();
         }
-        return permMapper.selectList(
-                new LambdaQueryWrapper<UserPermission>().eq(UserPermission::getUserId, userId));
+        return tupleMapper.selectList(
+                new LambdaQueryWrapper<com.photoalbum.entity.AuthTuple>()
+                        .eq(com.photoalbum.entity.AuthTuple::getSubjectType, "user")
+                        .eq(com.photoalbum.entity.AuthTuple::getSubjectId, userId));
     }
 
-    private boolean hasGlobalWhitelist(List<UserPermission> grants) {
+    private boolean hasGlobalWhitelist(List<com.photoalbum.entity.AuthTuple> grants) {
         return grants.stream().anyMatch(p ->
-                PermissionConstants.TARGET_GLOBAL.equals(p.getTargetType())
-                        && PermissionConstants.TYPE_WHITELIST.equals(p.getPermType()));
+                PermissionConstants.TARGET_GLOBAL.equals(p.getObjectType())
+                        && com.photoalbum.entity.AuthTuple.RELATION_ALLOW.equals(p.getRelation()));
     }
 
     /** 取指定授权类型的 target_id 集合 */
-    private Set<Long> targetIds(List<UserPermission> grants, String permType, String targetType) {
+    private Set<Long> targetIds(List<com.photoalbum.entity.AuthTuple> grants, String permType, String targetType) {
         Set<Long> ids = new LinkedHashSet<>();
-        for (UserPermission grant : grants) {
-            if (permType.equals(grant.getPermType())
-                    && targetType.equals(grant.getTargetType())
-                    && grant.getTargetId() != null) {
-                ids.add(grant.getTargetId());
+        for (com.photoalbum.entity.AuthTuple grant : grants) {
+            if (permType.equals(grant.getRelation())
+                    && targetType.equals(grant.getObjectType())
+                    && grant.getObjectId() != null) {
+                ids.add(grant.getObjectId());
             }
         }
         return ids;

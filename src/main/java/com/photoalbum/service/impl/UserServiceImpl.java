@@ -8,13 +8,13 @@ import com.photoalbum.dto.UserUpsertDTO;
 import com.photoalbum.entity.CollectionMember;
 import com.photoalbum.entity.Photo;
 import com.photoalbum.entity.User;
-import com.photoalbum.entity.UserPermission;
+import com.photoalbum.entity.AuthTuple;
 import com.photoalbum.mapper.CategoryMapper;
 import com.photoalbum.mapper.CollectionMemberMapper;
 import com.photoalbum.mapper.PhotoCollectionMapper;
 import com.photoalbum.mapper.PhotoMapper;
 import com.photoalbum.mapper.UserMapper;
-import com.photoalbum.mapper.UserPermissionMapper;
+import com.photoalbum.mapper.AuthTupleMapper;
 import com.photoalbum.security.AccessPolicy;
 import com.photoalbum.security.CurrentUserSupport;
 import com.photoalbum.service.AuditService;
@@ -31,7 +31,7 @@ import java.util.*;
 public class UserServiceImpl implements UserService {
 
     private final UserMapper userMapper;
-    private final UserPermissionMapper permMapper;
+    private final AuthTupleMapper tupleMapper;
     private final PhotoMapper photoMapper;
     private final PhotoCollectionMapper collectionMapper;
     private final CategoryMapper categoryMapper;
@@ -40,13 +40,13 @@ public class UserServiceImpl implements UserService {
     private final AccessPolicy accessPolicy;
     private final PasswordEncoder passwordEncoder;
 
-    public UserServiceImpl(UserMapper userMapper, UserPermissionMapper permMapper,
+    public UserServiceImpl(UserMapper userMapper, AuthTupleMapper tupleMapper,
                            PhotoMapper photoMapper, PhotoCollectionMapper collectionMapper,
                            CategoryMapper categoryMapper, CollectionMemberMapper memberMapper,
                            AuditService auditService, AccessPolicy accessPolicy,
                            @Lazy PasswordEncoder passwordEncoder) {
         this.userMapper = userMapper;
-        this.permMapper = permMapper;
+        this.tupleMapper = tupleMapper;
         this.photoMapper = photoMapper;
         this.collectionMapper = collectionMapper;
         this.categoryMapper = categoryMapper;
@@ -165,7 +165,9 @@ public class UserServiceImpl implements UserService {
             throw new BusinessException(400, "不能删除最后一个管理员");
         }
         // 同时删除该用户的权限条目
-        permMapper.delete(new LambdaQueryWrapper<UserPermission>().eq(UserPermission::getUserId, id));
+        tupleMapper.delete(new LambdaQueryWrapper<AuthTuple>()
+                .eq(AuthTuple::getSubjectType, "user")
+                .eq(AuthTuple::getSubjectId, id));
         userMapper.deleteById(id);
         auditService.record(AuditService.ACTION_USER_DELETE, AuditService.TARGET_USER, id,
                 String.format("删除账号 %s（角色 %s），同时清除其全部授权条目",
@@ -244,17 +246,19 @@ public class UserServiceImpl implements UserService {
 
     @Override
     public List<Map<String, Object>> getUserPermissions(Long userId) {
-        List<UserPermission> perms = permMapper.selectList(
-                new LambdaQueryWrapper<UserPermission>().eq(UserPermission::getUserId, userId));
+        List<AuthTuple> tuples = tupleMapper.selectList(new LambdaQueryWrapper<AuthTuple>()
+                .eq(AuthTuple::getSubjectType, "user")
+                .eq(AuthTuple::getSubjectId, userId));
         List<Map<String, Object>> result = new ArrayList<>();
-        for (UserPermission p : perms) {
+        for (AuthTuple tuple : tuples) {
             Map<String, Object> m = new HashMap<>();
-            m.put("id", p.getId());
-            m.put("permType", p.getPermType());
-            m.put("targetType", p.getTargetType());
-            m.put("targetId", p.getTargetId());
-            m.put("createdAt", p.getCreatedAt());
-            m.put("createdBy", p.getCreatedBy());
+            m.put("id", tuple.getId());
+            // 对外保持原有 W/B 形状，前端与既有调用方无需改动
+            m.put("permType", AuthTuple.RELATION_ALLOW.equals(tuple.getRelation()) ? "W" : "B");
+            m.put("targetType", tuple.getObjectType());
+            m.put("targetId", tuple.getObjectId());
+            m.put("createdAt", tuple.getCreatedAt());
+            m.put("createdBy", tuple.getCreatedBy());
             result.add(m);
         }
         return result;
@@ -263,7 +267,7 @@ public class UserServiceImpl implements UserService {
     @Override
     @Transactional
     public void addPermission(Long userId, String permType, String targetType, Long targetId) {
-        // 取值合法性（枚举校验，避免写入 W/w、photo/xxx 之类脏值导致判定失效）
+        // 取值合法性（W/B 与对象类型枚举），避免写入脏值导致判定失效
         PermissionConstants.requireValid(permType, targetType);
         if (userMapper.selectById(userId) == null) {
             throw new BusinessException(404, "用户不存在");
@@ -280,26 +284,30 @@ public class UserServiceImpl implements UserService {
             resolvedTargetId = targetId;
         }
 
-        // 同一对象不重复授权
-        long duplicated = permMapper.selectCount(new LambdaQueryWrapper<UserPermission>()
-                .eq(UserPermission::getUserId, userId)
-                .eq(UserPermission::getPermType, permType)
-                .eq(UserPermission::getTargetType, targetType)
-                .eq(UserPermission::getTargetId, resolvedTargetId));
+        String relation = PermissionConstants.TYPE_WHITELIST.equals(permType)
+                ? AuthTuple.RELATION_ALLOW : AuthTuple.RELATION_DENY;
+
+        long duplicated = tupleMapper.selectCount(new LambdaQueryWrapper<AuthTuple>()
+                .eq(AuthTuple::getSubjectType, "user")
+                .eq(AuthTuple::getSubjectId, userId)
+                .eq(AuthTuple::getRelation, relation)
+                .eq(AuthTuple::getObjectType, targetType)
+                .eq(AuthTuple::getObjectId, resolvedTargetId));
         if (duplicated > 0) {
             throw new BusinessException(400, "该授权条目已存在");
         }
 
-        UserPermission permission = new UserPermission();
-        permission.setUserId(userId);
-        permission.setPermType(permType);
-        permission.setTargetType(targetType);
-        permission.setTargetId(resolvedTargetId);
+        AuthTuple tuple = new AuthTuple();
+        tuple.setSubjectType("user");
+        tuple.setSubjectId(userId);
+        tuple.setRelation(relation);
+        tuple.setObjectType(targetType);
+        tuple.setObjectId(resolvedTargetId);
         User operator = CurrentUserSupport.getCurrentUser();
-        permission.setCreatedBy(operator != null ? operator.getId() : null);
-        permMapper.insert(permission);
+        tuple.setCreatedBy(operator != null ? operator.getId() : null);
+        tupleMapper.insert(tuple);
 
-        auditService.record(AuditService.ACTION_GRANT_ADD, AuditService.TARGET_PERMISSION, permission.getId(),
+        auditService.record(AuditService.ACTION_GRANT_ADD, AuditService.TARGET_PERMISSION, tuple.getId(),
                 String.format("为账号 %s 新增授权：%s", describeUser(userId),
                         describePerm(permType, targetType, resolvedTargetId)));
     }
@@ -308,12 +316,13 @@ public class UserServiceImpl implements UserService {
     @Transactional
     public void removePermission(Long permId) {
         // 先取出被删除的条目内容，保证审计可追溯
-        UserPermission permission = permMapper.selectById(permId);
-        permMapper.deleteById(permId);
-        if (permission != null) {
+        AuthTuple tuple = tupleMapper.selectById(permId);
+        tupleMapper.deleteById(permId);
+        if (tuple != null) {
             auditService.record(AuditService.ACTION_GRANT_REMOVE, AuditService.TARGET_PERMISSION, permId,
-                    String.format("移除账号 %s 的授权：%s", describeUser(permission.getUserId()),
-                            describePerm(permission.getPermType(), permission.getTargetType(), permission.getTargetId())));
+                    String.format("移除账号 %s 的授权：%s", describeUser(tuple.getSubjectId()),
+                            describePerm(AuthTuple.RELATION_ALLOW.equals(tuple.getRelation()) ? "W" : "B",
+                                    tuple.getObjectType(), tuple.getObjectId())));
         }
     }
 

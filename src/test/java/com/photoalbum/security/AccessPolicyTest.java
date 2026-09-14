@@ -5,9 +5,9 @@ import com.photoalbum.entity.Photo;
 import com.photoalbum.entity.PhotoCollection;
 import com.photoalbum.entity.PhotoCollectionPhoto;
 import com.photoalbum.entity.User;
-import com.photoalbum.entity.UserPermission;
+import com.photoalbum.entity.AuthTuple;
 import com.photoalbum.mapper.PhotoCollectionPhotoMapper;
-import com.photoalbum.mapper.UserPermissionMapper;
+import com.photoalbum.mapper.AuthTupleMapper;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
@@ -37,7 +37,7 @@ import static org.mockito.Mockito.when;
 class AccessPolicyTest {
 
     @Mock
-    private UserPermissionMapper permMapper;
+    private AuthTupleMapper tupleMapper;
 
     @Mock
     private PhotoCollectionPhotoMapper collectionPhotoMapper;
@@ -102,7 +102,7 @@ class AccessPolicyTest {
         @Test
         @DisplayName("viewer 无任何授权条目：默认拒绝（此前的行为是可看全部私密）")
         void viewerWithoutGrantsIsDeniedByDefault() {
-            when(permMapper.selectList(any())).thenReturn(Collections.emptyList());
+            when(tupleMapper.selectList(any())).thenReturn(Collections.emptyList());
             User viewer = viewer();
 
             AccessPolicy.PrivateScope scope = policy.photoScope(viewer);
@@ -115,7 +115,7 @@ class AccessPolicyTest {
         @Test
         @DisplayName("viewer 照片白名单：仅授权照片可见")
         void viewerWithPhotoWhitelist() {
-            when(permMapper.selectList(any())).thenReturn(List.of(grant("W", "photo", 5L)));
+            when(tupleMapper.selectList(any())).thenReturn(List.of(grant("W", "photo", 5L)));
             User viewer = viewer();
 
             assertThat(policy.canViewPhoto(viewer, photo(5L, 1))).isTrue();
@@ -126,7 +126,7 @@ class AccessPolicyTest {
         @Test
         @DisplayName("viewer 合集白名单：级联到合集内照片（合集详情场景逐张判定零查询）")
         void viewerWithCollectionWhitelistCascades() {
-            when(permMapper.selectList(any())).thenReturn(List.of(grant("W", "collection", 9L)));
+            when(tupleMapper.selectList(any())).thenReturn(List.of(grant("W", "collection", 9L)));
             User viewer = viewer();
 
             assertThat(policy.canViewPhotoInCollection(viewer, photo(5L, 1), 9L)).isTrue();
@@ -140,7 +140,7 @@ class AccessPolicyTest {
         @Test
         @DisplayName("未知合集归属时：一次小查询确认照片是否属于被授权合集")
         void shouldResolveCollectionMembershipWhenUnknown() {
-            when(permMapper.selectList(any())).thenReturn(List.of(grant("W", "collection", 9L)));
+            when(tupleMapper.selectList(any())).thenReturn(List.of(grant("W", "collection", 9L)));
             when(collectionPhotoMapper.selectCount(any())).thenReturn(1L);
 
             assertThat(policy.canViewPhoto(viewer(), photo(5L, 1))).isTrue();
@@ -149,7 +149,7 @@ class AccessPolicyTest {
         @Test
         @DisplayName("viewer global 白名单：全部私密可见")
         void viewerWithGlobalGrantSeesAllPrivate() {
-            when(permMapper.selectList(any())).thenReturn(List.of(grant("W", "global", 0L)));
+            when(tupleMapper.selectList(any())).thenReturn(List.of(grant("W", "global", 0L)));
             User viewer = viewer();
 
             assertThat(policy.photoScope(viewer).all()).isTrue();
@@ -159,7 +159,7 @@ class AccessPolicyTest {
         @Test
         @DisplayName("viewer global 白名单 + 黑名单：排除项不可见")
         void viewerWithGlobalGrantAndBlacklist() {
-            when(permMapper.selectList(any())).thenReturn(Arrays.asList(
+            when(tupleMapper.selectList(any())).thenReturn(Arrays.asList(
                     grant("W", "global", 0L), grant("B", "photo", 7L)));
             User viewer = viewer();
 
@@ -174,7 +174,7 @@ class AccessPolicyTest {
         @Test
         @DisplayName("黑名单在白名单范围内做减法（同一对象同时授权与排除时以排除为准）")
         void blacklistSubtractsFromWhitelist() {
-            when(permMapper.selectList(any())).thenReturn(Arrays.asList(
+            when(tupleMapper.selectList(any())).thenReturn(Arrays.asList(
                     grant("W", "photo", 5L), grant("B", "photo", 5L)));
             User viewer = viewer();
 
@@ -184,7 +184,7 @@ class AccessPolicyTest {
         @Test
         @DisplayName("分类白名单：该分类下的照片可见（服务端内存判定，无需展开照片 ID）")
         void viewerWithCategoryWhitelist() {
-            when(permMapper.selectList(any())).thenReturn(List.of(grant("W", "category", 3L)));
+            when(tupleMapper.selectList(any())).thenReturn(List.of(grant("W", "category", 3L)));
             User viewer = viewer();
 
             Photo inCategory = photo(5L, 1);
@@ -199,7 +199,7 @@ class AccessPolicyTest {
         @Test
         @DisplayName("合集内逐张判定：已知所属合集时不产生额外查询（合集详情批量场景）")
         void inCollectionCheckNeedsNoQuery() {
-            when(permMapper.selectList(any())).thenReturn(List.of(grant("W", "collection", 9L)));
+            when(tupleMapper.selectList(any())).thenReturn(List.of(grant("W", "collection", 9L)));
             User viewer = viewer();
             Photo privatePhoto = photo(5L, 1);
 
@@ -240,7 +240,7 @@ class AccessPolicyTest {
         @Test
         @DisplayName("无授权 viewer：查询条件被限定为仅公开照片")
         void viewerFilterRestrictsToPublic() {
-            when(permMapper.selectList(any())).thenReturn(Collections.emptyList());
+            when(tupleMapper.selectList(any())).thenReturn(Collections.emptyList());
             LambdaQueryWrapper<Photo> wrapper = new LambdaQueryWrapper<>();
             policy.applyPhotoFilter(wrapper, viewer());
 
@@ -259,20 +259,20 @@ class AccessPolicyTest {
         @Test
         @DisplayName("合集级授权以子查询表达，不把合集内照片 ID 展开成大 IN")
         void collectionGrantUsesSubQuery() {
-            when(permMapper.selectList(any())).thenReturn(List.of(grant("W", "collection", 9L)));
+            when(tupleMapper.selectList(any())).thenReturn(List.of(grant("W", "collection", 9L)));
             LambdaQueryWrapper<Photo> wrapper = new LambdaQueryWrapper<>();
             policy.applyPhotoFilter(wrapper, viewer());
 
             String sql = wrapper.getSqlSegment();
             assertThat(sql).contains("EXISTS");
-            assertThat(sql).contains("t_user_permission");
+            assertThat(sql).contains("t_auth_tuple");
             verify(collectionPhotoMapper, never()).selectList(any());
         }
 
         @Test
         @DisplayName("分类级授权以子查询表达")
         void categoryGrantUsesSubQuery() {
-            when(permMapper.selectList(any())).thenReturn(List.of(grant("W", "category", 3L)));
+            when(tupleMapper.selectList(any())).thenReturn(List.of(grant("W", "category", 3L)));
             LambdaQueryWrapper<Photo> wrapper = new LambdaQueryWrapper<>();
             policy.applyPhotoFilter(wrapper, viewer());
 
@@ -301,7 +301,7 @@ class AccessPolicyTest {
         @Test
         @DisplayName("已发布私密合集：无授权访客不可访问")
         void privateCollectionRequiresGrant() {
-            when(permMapper.selectList(any())).thenReturn(Collections.emptyList());
+            when(tupleMapper.selectList(any())).thenReturn(Collections.emptyList());
             PhotoCollection privateCol = collection(4L, 1, 1);
 
             assertThat(policy.canAccessCollection(viewer(), privateCol)).isFalse();
@@ -333,13 +333,14 @@ class AccessPolicyTest {
         return user("viewer", 0, 0, 1);
     }
 
-    private UserPermission grant(String permType, String targetType, Long targetId) {
-        UserPermission permission = new UserPermission();
-        permission.setUserId(100L);
-        permission.setPermType(permType);
-        permission.setTargetType(targetType);
-        permission.setTargetId(targetId);
-        return permission;
+    private AuthTuple grant(String permType, String targetType, Long targetId) {
+        AuthTuple p = new AuthTuple();
+        p.setSubjectType("user");
+        p.setSubjectId(100L);
+        p.setRelation("W".equals(permType) ? AuthTuple.RELATION_ALLOW : AuthTuple.RELATION_DENY);
+        p.setObjectType(targetType);
+        p.setObjectId(targetId);
+        return p;
     }
 
     private Photo photo(Long id, int isPrivate) {
