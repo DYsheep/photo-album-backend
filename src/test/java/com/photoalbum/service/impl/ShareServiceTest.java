@@ -49,6 +49,15 @@ class ShareServiceTest {
     /** 对象存储客户端：地址解析器需要它做预签名（测试中不触发真实调用） */
     @Mock
     private COSClient cosClient;
+    @Mock
+    private com.photoalbum.mapper.PhotoCollectionMapper collectionMapper;
+
+    @Mock
+    private com.photoalbum.mapper.PhotoCollectionPhotoMapper collectionPhotoMapper;
+
+    @Mock
+    private com.photoalbum.mapper.UserMapper userMapper;
+
 
     @InjectMocks
     private ShareServiceImpl shareService;
@@ -633,5 +642,121 @@ class ShareServiceTest {
         shareLink.setPhotoId(photoId);
         shareLink.setCreatedAt(LocalDateTime.now());
         return shareLink;
+    }
+
+    @Nested
+    @DisplayName("合集分享 - 可见性 / 口令 / 过期（含 deny 不泄露）")
+    class CollectionShareTests {
+
+        /** 构造一条合集分享记录 */
+        private ShareLink collectionShare(Long collectionId, boolean includePrivate, String encodedCode,
+                                          java.time.LocalDateTime expiresAt) {
+            ShareLink link = new ShareLink();
+            link.setId(99L);
+            link.setCode("Coll1234");
+            link.setTargetType("collection");
+            link.setTargetId(collectionId);
+            link.setIncludePrivate(includePrivate ? 1 : 0);
+            link.setAccessCode(encodedCode);
+            link.setExpiresAt(expiresAt);
+            link.setCreatedBy(1L);
+            return link;
+        }
+
+        private Photo photoOf(Long id, int isPrivate) {
+            Photo photo = new Photo();
+            photo.setId(id);
+            photo.setTitle("照片" + id);
+            photo.setUrl("https://cos.example.com/p" + id + ".jpg");
+            photo.setThumbnailUrl("https://cos.example.com/t" + id + ".jpg");
+            photo.setIsPrivate(isPrivate);
+            return photo;
+        }
+
+        @Test
+        @DisplayName("含私密：以创建者视角判定，被其 deny 的照片不出现在分享中")
+        void denyPhotoNeverLeaks() {
+            Long cid = 8L;
+            when(shareLinkMapper.selectOne(any(LambdaQueryWrapper.class)))
+                    .thenReturn(collectionShare(cid, true, null, null));
+            com.photoalbum.entity.PhotoCollection collection = new com.photoalbum.entity.PhotoCollection();
+            collection.setId(cid);
+            collection.setName("我亲爱的你呀");
+            when(collectionMapper.selectById(cid)).thenReturn(collection);
+            when(collectionPhotoMapper.selectList(any(LambdaQueryWrapper.class))).thenReturn(Arrays.asList(
+                    rel(cid, 10L), rel(cid, 11L)));
+            when(photoMapper.selectById(10L)).thenReturn(photoOf(10L, 1));
+            when(photoMapper.selectById(11L)).thenReturn(photoOf(11L, 1));
+            // 创建者：可见 10 号，不可见 11 号（被 deny）
+            when(userMapper.selectById(1L)).thenReturn(new com.photoalbum.entity.User());
+            when(accessPolicy.canViewPhoto(any(), any())).thenAnswer(inv ->
+                    ((Photo) inv.getArgument(1)).getId().equals(10L));
+
+            ShareLinkDTO dto = shareService.getByCode("Coll1234");
+
+            assertNotNull(dto.getPhotos());
+            assertEquals(1, dto.getPhotos().size(), "被 deny 的照片不应出现在分享里");
+            assertEquals(10L, dto.getPhotos().get(0).getId());
+            assertEquals("collection", dto.getTargetType());
+            assertEquals("我亲爱的你呀", dto.getCollectionName());
+        }
+
+        @Test
+        @DisplayName("不含私密：只返回公开照片")
+        void publicOnlyWhenIncludePrivateFalse() {
+            Long cid = 9L;
+            when(shareLinkMapper.selectOne(any(LambdaQueryWrapper.class)))
+                    .thenReturn(collectionShare(cid, false, null, null));
+            com.photoalbum.entity.PhotoCollection collection = new com.photoalbum.entity.PhotoCollection();
+            collection.setId(cid);
+            collection.setName("公开合集");
+            when(collectionMapper.selectById(cid)).thenReturn(collection);
+            when(collectionPhotoMapper.selectList(any(LambdaQueryWrapper.class))).thenReturn(Arrays.asList(
+                    rel(cid, 20L), rel(cid, 21L)));
+            when(photoMapper.selectById(20L)).thenReturn(photoOf(20L, 0));
+            when(photoMapper.selectById(21L)).thenReturn(photoOf(21L, 1));
+
+            ShareLinkDTO dto = shareService.getByCode("Coll1234");
+
+            assertEquals(1, dto.getPhotos().size(), "不含私密时只应有公开照片");
+            assertEquals(20L, dto.getPhotos().get(0).getId());
+        }
+
+        @Test
+        @DisplayName("设置了口令：缺失或错误口令一律拒绝")
+        void accessCodeRequired() {
+            Long cid = 8L;
+            String encoded = "$2a$10$abcdefghijklmnopqrstuv";
+            when(shareLinkMapper.selectOne(any(LambdaQueryWrapper.class)))
+                    .thenReturn(collectionShare(cid, false, encoded, null));
+
+            assertThatThrownBy(() -> shareService.getByCode("Coll1234"))
+                    .isInstanceOf(BusinessException.class)
+                    .hasMessageContaining("口令");
+
+            assertThatThrownBy(() -> shareService.getByCode("Coll1234", "wrong-code"))
+                    .isInstanceOf(BusinessException.class)
+                    .hasMessageContaining("口令");
+        }
+
+        @Test
+        @DisplayName("已过期：一律按不存在处理（404）")
+        void expiredReturnsNotFound() {
+            Long cid = 8L;
+            when(shareLinkMapper.selectOne(any(LambdaQueryWrapper.class)))
+                    .thenReturn(collectionShare(cid, false, null, LocalDateTime.now().minusDays(1)));
+
+            assertThatThrownBy(() -> shareService.getByCode("Coll1234"))
+                    .isInstanceOf(BusinessException.class)
+                    .hasMessageContaining("不存在或已失效");
+        }
+
+        private com.photoalbum.entity.PhotoCollectionPhoto rel(Long cid, Long photoId) {
+            com.photoalbum.entity.PhotoCollectionPhoto rel = new com.photoalbum.entity.PhotoCollectionPhoto();
+            rel.setCollectionId(cid);
+            rel.setPhotoId(photoId);
+            rel.setSortOrder(0);
+            return rel;
+        }
     }
 }
