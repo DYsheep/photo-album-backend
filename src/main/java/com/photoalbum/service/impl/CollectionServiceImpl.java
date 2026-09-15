@@ -302,6 +302,20 @@ public class CollectionServiceImpl implements CollectionService {
         collectionPhotoMapper.delete(wrapper);
     }
 
+    /**
+     * 合集封面地址：优先缩略图、其次原图；私密照片由解析器签发短期地址。
+     *
+     * 注意：不能直接使用库中存储的直链——私密照片的对象 ACL 为私有，
+     * 直链会返回 403，表现为封面裂图（本方法即为此前的缺口）。
+     */
+    private String coverUrlOf(Photo photo) {
+        if (photo == null) {
+            return null;
+        }
+        String thumb = photoUrlResolver.resolveThumbnail(photo.getThumbnailUrl(), photo.getIsPrivate());
+        return thumb != null ? thumb : photoUrlResolver.resolve(photo.getUrl(), photo.getIsPrivate());
+    }
+
     private CollectionDTO toDTO(PhotoCollection collection) {
         CollectionDTO dto = new CollectionDTO();
         dto.setId(collection.getId());
@@ -319,8 +333,7 @@ public class CollectionServiceImpl implements CollectionService {
         if (collection.getCoverPhotoId() != null) {
             Photo cover = photoMapper.selectById(collection.getCoverPhotoId());
             if (cover != null) {
-                String u = cover.getThumbnailUrl();
-                dto.setCoverUrl(u != null && u.startsWith("http") ? u : accessUrlPrefix + u);
+                dto.setCoverUrl(coverUrlOf(cover));
             }
         }
         if (dto.getCoverUrl() == null) {
@@ -331,8 +344,7 @@ public class CollectionServiceImpl implements CollectionService {
             if (first != null) {
                 Photo firstPhoto = photoMapper.selectById(first.getPhotoId());
                 if (firstPhoto != null) {
-                    String u = firstPhoto.getThumbnailUrl();
-                    dto.setCoverUrl(u != null && u.startsWith("http") ? u : accessUrlPrefix + u);
+                    dto.setCoverUrl(coverUrlOf(firstPhoto));
                 }
             }
         }
