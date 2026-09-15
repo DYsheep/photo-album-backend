@@ -13,6 +13,9 @@ public class ShareLinkDTO {
     /** 分享对象类型：photo / collection（前端据此分派渲染） */
     private String targetType;
 
+    /** 分享对象 ID（照片或合集） */
+    private Long targetId;
+
     /** 合集分享：合集 ID / 名称 / 描述 */
     private Long collectionId;
     private String collectionName;

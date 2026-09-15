@@ -277,11 +277,17 @@ public class ShareServiceImpl implements ShareService {
             ShareLinkDTO dto = toDTO(sl);
             dto.setShareUrl(shareBaseUrl + "/share/" + sl.getCode());
 
-            // 联查照片获取标题
-            Photo photo = photoMapper.selectById(sl.getPhotoId());
-            if (photo != null) {
-                dto.setPhotoTitle(photo.getTitle());
-                dto.setPhotoUrl(photoUrlResolver.resolve(photo.getUrl(), photo.getIsPrivate()));
+            // 关联对象：合集分享取合集名，照片分享取照片标题
+            if ("collection".equals(sl.getTargetType())) {
+                com.photoalbum.entity.PhotoCollection col = collectionMapper.selectById(sl.getTargetId());
+                dto.setCollectionId(sl.getTargetId());
+                dto.setCollectionName(col != null ? col.getName() : null);
+            } else {
+                Photo photo = photoMapper.selectById(sl.getPhotoId());
+                if (photo != null) {
+                    dto.setPhotoTitle(photo.getTitle());
+                    dto.setPhotoUrl(photoUrlResolver.resolve(photo.getUrl(), photo.getIsPrivate()));
+                }
             }
             return dto;
         }).collect(Collectors.toList());
@@ -357,6 +363,9 @@ public class ShareServiceImpl implements ShareService {
         dto.setId(shareLink.getId());
         dto.setCode(shareLink.getCode());
         dto.setPhotoId(shareLink.getPhotoId());
+        dto.setTargetType(shareLink.getTargetType());
+        dto.setTargetId(shareLink.getTargetId());
+        dto.setIncludePrivate(shareLink.getIncludePrivate());
         dto.setCreatedAt(shareLink.getCreatedAt());
         dto.setExpiresAt(shareLink.getExpiresAt());
         dto.setExpired(shareLink.getExpiresAt() != null
