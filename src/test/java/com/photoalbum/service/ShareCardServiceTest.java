@@ -14,6 +14,8 @@ import com.photoalbum.mapper.ShareLinkMapper;
 import com.photoalbum.mapper.UserMapper;
 import com.photoalbum.security.AccessPolicy;
 import com.qcloud.cos.COSClient;
+import com.qcloud.cos.model.COSObject;
+import com.qcloud.cos.model.ObjectMetadata;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Nested;
@@ -24,6 +26,7 @@ import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import org.springframework.test.util.ReflectionTestUtils;
 
+import java.io.ByteArrayInputStream;
 import java.time.LocalDateTime;
 import java.util.List;
 
@@ -65,7 +68,6 @@ class ShareCardServiceTest {
     @BeforeEach
     void setUp() {
         ReflectionTestUtils.setField(shareCardService, "shareBaseUrl", BASE);
-        ReflectionTestUtils.setField(shareCardService, "cardPresignedTtlMinutes", 10080L);
         PhotoUrlResolver urlResolver = new PhotoUrlResolver(cosClient);
         ReflectionTestUtils.setField(urlResolver, "cosBucket", "test-bucket");
         ReflectionTestUtils.setField(urlResolver, "cosDomain", "https://cos.example.com");
@@ -191,7 +193,7 @@ class ShareCardServiceTest {
             ShareCard card = shareCardService.cardOf("Coll1234");
 
             assertThat(card.description()).isEqualTo("共 1 张照片");
-            assertThat(shareCardService.coverTargetOf("Coll1234"))
+            assertThat(shareCardService.coverStoredUrlOf("Coll1234"))
                     .isEqualTo("https://cos.example.com/p10_thumb.jpg");
         }
 
@@ -225,7 +227,7 @@ class ShareCardServiceTest {
 
             assertThat(card.title()).contains("失效");
             assertThat(card.imageUrl()).isEqualTo(DEFAULT_IMAGE);
-            assertThat(shareCardService.coverTargetOf("Priv1234")).isEqualTo(DEFAULT_IMAGE);
+            assertThat(shareCardService.coverStoredUrlOf("Priv1234")).isNull();
         }
     }
 
@@ -234,24 +236,24 @@ class ShareCardServiceTest {
     // ============================================================
 
     @Nested
-    @DisplayName("coverTargetOf() - 卡片封面跳转目标")
+    @DisplayName("coverStoredUrlOf() / coverImageOf() - 卡片封面")
     class CoverTargetTests {
 
         @Test
-        @DisplayName("链接不存在：返回站点默认图（永不返回 null）")
-        void missingLinkFallsBackToDefaultImage() {
+        @DisplayName("链接不存在：取不到封面")
+        void missingLinkReturnsNull() {
             when(shareLinkMapper.selectOne(any(LambdaQueryWrapper.class))).thenReturn(null);
 
-            assertThat(shareCardService.coverTargetOf("NoSuch01")).isEqualTo(DEFAULT_IMAGE);
+            assertThat(shareCardService.coverStoredUrlOf("NoSuch01")).isNull();
         }
 
         @Test
-        @DisplayName("需口令的分享：封面同样用默认图，不泄露任何照片")
-        void protectedShareUsesDefaultImage() {
+        @DisplayName("需口令的分享：不提供封面，不泄露任何照片")
+        void protectedShareReturnsNull() {
             when(shareLinkMapper.selectOne(any(LambdaQueryWrapper.class)))
                     .thenReturn(collectionLink(8L, false, "$2a$10$abcdefghijklmnopqrstuv"));
 
-            assertThat(shareCardService.coverTargetOf("Coll1234")).isEqualTo(DEFAULT_IMAGE);
+            assertThat(shareCardService.coverStoredUrlOf("Coll1234")).isNull();
         }
 
         @Test
@@ -267,7 +269,7 @@ class ShareCardServiceTest {
                     .thenReturn(List.of(rel(8L, 21L)));
             when(photoMapper.selectById(21L)).thenReturn(photo(21L, 0, "cover"));
 
-            assertThat(shareCardService.coverTargetOf("Coll1234"))
+            assertThat(shareCardService.coverStoredUrlOf("Coll1234"))
                     .isEqualTo("https://cos.example.com/cover_thumb.jpg");
         }
 
@@ -285,13 +287,13 @@ class ShareCardServiceTest {
             when(photoMapper.selectById(21L)).thenReturn(photo(21L, 1, "private"));
             when(photoMapper.selectById(22L)).thenReturn(photo(22L, 0, "public"));
 
-            assertThat(shareCardService.coverTargetOf("Coll1234"))
+            assertThat(shareCardService.coverStoredUrlOf("Coll1234"))
                     .isEqualTo("https://cos.example.com/public_thumb.jpg");
         }
 
         @Test
-        @DisplayName("合集内没有任何可见照片：返回站点默认图")
-        void noVisiblePhotoFallsBackToDefaultImage() {
+        @DisplayName("合集内没有任何可见照片：取不到封面")
+        void noVisiblePhotoReturnsNull() {
             when(shareLinkMapper.selectOne(any(LambdaQueryWrapper.class)))
                     .thenReturn(collectionLink(8L, false, null));
             PhotoCollection collection = new PhotoCollection();
@@ -301,17 +303,63 @@ class ShareCardServiceTest {
                     .thenReturn(List.of(rel(8L, 21L)));
             when(photoMapper.selectById(21L)).thenReturn(photo(21L, 1, "private"));
 
-            assertThat(shareCardService.coverTargetOf("Coll1234")).isEqualTo(DEFAULT_IMAGE);
+            assertThat(shareCardService.coverStoredUrlOf("Coll1234")).isNull();
         }
 
         @Test
-        @DisplayName("合集不存在：返回站点默认图")
-        void missingCollectionFallsBackToDefaultImage() {
+        @DisplayName("合集不存在：取不到封面")
+        void missingCollectionReturnsNull() {
             when(shareLinkMapper.selectOne(any(LambdaQueryWrapper.class)))
                     .thenReturn(collectionLink(8L, false, null));
             when(collectionMapper.selectById(8L)).thenReturn(null);
 
-            assertThat(shareCardService.coverTargetOf("Coll1234")).isEqualTo(DEFAULT_IMAGE);
+            assertThat(shareCardService.coverStoredUrlOf("Coll1234")).isNull();
+        }
+
+        @Test
+        @DisplayName("封面图片：直接读出对象字节与类型（平台抓图不跟随跳转，必须 200 直出）")
+        void coverImageReturnsObjectBytes() {
+            when(shareLinkMapper.selectOne(any(LambdaQueryWrapper.class)))
+                    .thenReturn(collectionLink(8L, false, null));
+            PhotoCollection collection = new PhotoCollection();
+            collection.setId(8L);
+            collection.setCoverPhotoId(21L);
+            when(collectionMapper.selectById(8L)).thenReturn(collection);
+            when(collectionPhotoMapper.selectList(any(LambdaQueryWrapper.class)))
+                    .thenReturn(List.of(rel(8L, 21L)));
+            when(photoMapper.selectById(21L)).thenReturn(photo(21L, 0, "cover"));
+
+            byte[] bytes = {(byte) 0xFF, (byte) 0xD8, 1, 2, 3};
+            ObjectMetadata metadata = new ObjectMetadata();
+            metadata.setContentType("image/jpeg");
+            COSObject cosObject = new COSObject();
+            cosObject.setObjectMetadata(metadata);
+            cosObject.setObjectContent(new ByteArrayInputStream(bytes));
+            when(cosClient.getObject("test-bucket", "cover_thumb.jpg")).thenReturn(cosObject);
+
+            PhotoUrlResolver.ObjectData data = shareCardService.coverImageOf("Coll1234");
+
+            assertThat(data).isNotNull();
+            assertThat(data.bytes()).containsExactly(bytes);
+            assertThat(data.contentType()).isEqualTo("image/jpeg");
+        }
+
+        @Test
+        @DisplayName("封面图片：对象读取失败时返回 null，由调用方退回默认图")
+        void coverImageReturnsNullWhenObjectUnreadable() {
+            when(shareLinkMapper.selectOne(any(LambdaQueryWrapper.class)))
+                    .thenReturn(collectionLink(8L, false, null));
+            PhotoCollection collection = new PhotoCollection();
+            collection.setId(8L);
+            collection.setCoverPhotoId(21L);
+            when(collectionMapper.selectById(8L)).thenReturn(collection);
+            when(collectionPhotoMapper.selectList(any(LambdaQueryWrapper.class)))
+                    .thenReturn(List.of(rel(8L, 21L)));
+            when(photoMapper.selectById(21L)).thenReturn(photo(21L, 0, "cover"));
+            when(cosClient.getObject("test-bucket", "cover_thumb.jpg"))
+                    .thenThrow(new RuntimeException("对象存储不可用"));
+
+            assertThat(shareCardService.coverImageOf("Coll1234")).isNull();
         }
     }
 

@@ -43,6 +43,9 @@ public class SharePageController {
     private static final String RELATIVE_TEMPLATE = "../frontend/dist/index.html";
     private static final String DEFAULT_TEMPLATE = "/opt/photo-album/frontend/dist/index.html";
 
+    /** 挂载点：卡片封面以隐藏图的形式插在它前面（部分平台取"页面第一张图"而非 og:image） */
+    private static final String BODY_ANCHOR = "<div id=\"app\">";
+
     private final ShareCardService shareCardService;
 
     @Value("${share.page-template:}")
@@ -55,7 +58,8 @@ public class SharePageController {
 
     @GetMapping(value = "/share/{code}", produces = "text/html;charset=UTF-8")
     public ResponseEntity<String> sharePage(@PathVariable String code) {
-        String metaBlock = renderMetaBlock(cardOf(code));
+        ShareCard card = cardOf(code);
+        String metaBlock = renderMetaBlock(card);
 
         String template = loadTemplate();
         if (template == null) {
@@ -66,7 +70,7 @@ public class SharePageController {
                     .body(metaBlock);
         }
 
-        String html = injectMeta(template, metaBlock);
+        String html = injectCoverImage(injectMeta(template, metaBlock), card.imageUrl());
         return ResponseEntity.ok()
                 .contentType(MediaType.valueOf("text/html;charset=UTF-8"))
                 .cacheControl(CacheControl.noCache())
@@ -148,6 +152,25 @@ public class SharePageController {
         }
         log.debug("分享页模板缺少卡片元数据标记，已清除同类标签后插入");
         return cleaned.substring(0, headEnd) + metaBlock + "\n  " + cleaned.substring(headEnd);
+    }
+
+    /**
+     * 把封面图以隐藏 img 的形式插到挂载点之前
+     *
+     * 除了 og:image，部分平台（如 QQ）取的是"页面里第一张图"；SPA 页面本身没有 img 标签，
+     * 这里补一张隐藏的（不参与布局、不可见），两类抓取策略都能拿到图。
+     */
+    static String injectCoverImage(String html, String imageUrl) {
+        if (imageUrl == null || imageUrl.isBlank()) {
+            return html;
+        }
+        int anchor = html.indexOf(BODY_ANCHOR);
+        if (anchor < 0) {
+            return html;
+        }
+        String tag = "<img src=\"" + escape(imageUrl) + "\" alt=\"\" aria-hidden=\"true\" "
+                + "style=\"position:absolute;left:-9999px;top:0;opacity:0\" />";
+        return html.substring(0, anchor) + tag + html.substring(anchor);
     }
 
     /** 移除模板中原有的标题与卡片类元标签（含 title 的文本内容） */

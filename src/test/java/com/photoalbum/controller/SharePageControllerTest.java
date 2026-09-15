@@ -77,6 +77,30 @@ class SharePageControllerTest {
         assertThat(block).contains("&lt;b&gt;");
     }
 
+    @Test
+    @DisplayName("封面图以隐藏 img 插到挂载点之前（部分平台取的是页面第一张图）")
+    void injectsHiddenCoverImage() {
+        String template = "<html><head></head><body><div id=\"app\"></div></body></html>";
+
+        String html = SharePageController.injectCoverImage(template,
+                "https://www.dyframe.art/api/share/AbCd1234/cover");
+
+        assertThat(html).contains("<img src=\"https://www.dyframe.art/api/share/AbCd1234/cover\"");
+        assertThat(html.indexOf("<img")).isLessThan(html.indexOf("<div id=\"app\">"));
+        // 用绝对定位隐藏而不是 display:none —— 部分抓取器会跳过 display:none 的图片
+        assertThat(html).contains("left:-9999px");
+        assertThat(html).doesNotContain("display:none");
+    }
+
+    @Test
+    @DisplayName("没有封面地址时不插入 img 标签")
+    void skipsCoverImageWhenAbsent() {
+        String template = "<html><body><div id=\"app\"></div></body></html>";
+
+        assertThat(SharePageController.injectCoverImage(template, null)).isEqualTo(template);
+        assertThat(SharePageController.injectCoverImage(template, "   ")).isEqualTo(template);
+    }
+
     private int countOccurrences(String text, String needle) {
         int count = 0;
         int index = text.indexOf(needle);

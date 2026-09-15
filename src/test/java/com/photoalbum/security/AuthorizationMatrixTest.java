@@ -95,9 +95,8 @@ class AuthorizationMatrixTest {
         when(userService.previewVisibility(anyLong())).thenReturn(Map.of());
         when(auditService.recent(anyInt())).thenReturn(List.of());
         when(photoMapper.selectList(org.mockito.ArgumentMatchers.any())).thenReturn(List.of());
-        // 卡片封面：返回站点默认图，使接口无需访问数据库即可完成跳转
-        when(shareCardService.coverTargetOf(org.mockito.ArgumentMatchers.anyString()))
-                .thenReturn("https://www.dyframe.art/icons/icon-512.png");
+        // 卡片封面：取不到封面时退回站点默认图（未 stub coverImageOf → 返回 null 走兜底分支）
+        when(shareCardService.defaultImageUrl()).thenReturn("https://www.dyframe.art/icons/icon-512.png");
     }
 
     // ============================================================

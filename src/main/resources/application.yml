@@ -61,8 +61,6 @@ cos:
   private-acl-enabled: true
   # 私密照片预签名地址有效期（分钟）
   presigned-ttl-minutes: 60
-  # 分享卡片封面预签名有效期（分钟）：社交平台会长期缓存卡片图，需要比页面级地址更长的有效期
-  card-presigned-ttl-minutes: 10080
 
 # 分享链接配置（生产环境通过环境变量 SHARE_BASE_URL 覆盖）
 share:

@@ -7,11 +7,13 @@ import com.photoalbum.dto.ShareLinkDTO;
 import com.photoalbum.entity.User;
 import com.photoalbum.security.CurrentUserSupport;
 import com.photoalbum.service.PhotoService;
+import com.photoalbum.service.PhotoUrlResolver;
 import com.photoalbum.service.ShareCardService;
 import com.photoalbum.service.ShareService;
 import lombok.RequiredArgsConstructor;
 import org.springframework.http.CacheControl;
 import org.springframework.http.HttpStatus;
+import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.security.access.prepost.PreAuthorize;
 import org.springframework.web.bind.annotation.*;
@@ -158,20 +160,23 @@ public class ShareController {
      * 分享卡片封面图
      * GET /api/share/{code}/cover
      *
-     * 供社交平台抓取 og:image 使用：分享码本身即凭证，因此无需登录；
-     * 命中不到可用封面时（链接失效、需口令、无可见照片）统一跳到站点默认图，不暴露任何信息。
-     * 返回 302 而不是直接给出地址，是为了让页面里引用的是一个"永不过期"的同域地址
-     * （卡片图可能被平台长期缓存，而预签名地址会过期）。
+     * 供社交平台抓取 og:image 使用：分享码本身即凭证，因此无需登录。
+     * **必须直接返回图片字节（200）**：微信等平台抓取缩略图时不跟随 302 跳转，
+     * 给跳转地址会导致分享卡片没有图。图片由服务端从对象存储代取，地址始终是同域、无需签名的稳定地址。
+     * 取不到封面时（链接失效、需口令、无可见照片）退回站点默认图，不暴露任何信息。
      */
     @GetMapping("/api/share/{code}/cover")
-    public ResponseEntity<Void> shareCover(@PathVariable String code) {
-        String target = shareCardService.coverTargetOf(code);
-        if (target == null || target.isBlank()) {
-            // 理论上不会发生（服务内部有兜底），这里只做防御，避免拼出非法跳转地址
-            return ResponseEntity.notFound().build();
+    public ResponseEntity<byte[]> shareCover(@PathVariable String code) {
+        PhotoUrlResolver.ObjectData image = shareCardService.coverImageOf(code);
+        if (image != null && image.bytes() != null && image.bytes().length > 0) {
+            return ResponseEntity.ok()
+                    .contentType(MediaType.parseMediaType(image.contentType()))
+                    .cacheControl(CacheControl.maxAge(Duration.ofDays(1)).cachePublic())
+                    .body(image.bytes());
         }
+        // 兜底：跳站内默认图（同为静态文件，正常抓取路径下不会走到这里）
         return ResponseEntity.status(HttpStatus.FOUND)
-                .location(URI.create(target))
+                .location(URI.create(shareCardService.defaultImageUrl()))
                 .cacheControl(CacheControl.maxAge(Duration.ofHours(1)).cachePublic())
                 .build();
     }

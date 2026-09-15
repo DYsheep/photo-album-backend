@@ -62,10 +62,6 @@ public class ShareCardService {
     @Value("${share.base-url:http://localhost:5173}")
     private String shareBaseUrl;
 
-    /** 卡片封面预签名有效期（分钟）：社交平台会长期缓存卡片图，默认 7 天 */
-    @Value("${cos.card-presigned-ttl-minutes:10080}")
-    private long cardPresignedTtlMinutes;
-
     // ============================================================
     // 对外能力
     // ============================================================
@@ -104,26 +100,34 @@ public class ShareCardService {
     }
 
     /**
-     * 卡片封面图的跳转目标（永不返回 null）
+     * 卡片封面照在对象存储中的原始地址（取不到返回 null）
      *
-     * 返回站点同域地址：调用方 302 过去即可，避免把预签名地址直接写进页面
-     * （预签名地址会过期，而社交平台可能长期保留卡片引用的地址）。
+     * 返回"存储地址"而不是签名地址：封面由本服务代取字节后直出（见 coverImageOf），
+     * 页面里引用的是一个永不过期、且不跳转的同域地址。
      */
-    public String coverTargetOf(String code) {
+    public String coverStoredUrlOf(String code) {
         ShareLink link = findLiveLink(code);
         if (link == null || hasAccessCode(link)) {
-            return defaultImage();
+            return null;
         }
         Photo cover = coverPhoto(link);
-        if (cover == null) {
-            return defaultImage();
-        }
-        String stored = firstNonBlank(cover.getThumbnailUrl(), cover.getUrl());
-        if (stored == null) {
-            return defaultImage();
-        }
-        // 私密照片用较长有效期的预签名地址（卡片图会被平台反复抓取）
-        return photoUrlResolver.resolveWithTtl(stored, cover.getIsPrivate(), cardPresignedTtlMinutes);
+        return cover == null ? null : firstNonBlank(cover.getThumbnailUrl(), cover.getUrl());
+    }
+
+    /**
+     * 卡片封面图片（同域直出，不做任何跳转）
+     *
+     * 微信等平台抓取缩略图时**不跟随 302 跳转**，因此这里直接返回图片字节；
+     * 取不到封面（链接失效 / 需口令 / 无可见照片 / 对象读取失败）返回 null，由调用方退回默认图。
+     */
+    public PhotoUrlResolver.ObjectData coverImageOf(String code) {
+        String stored = coverStoredUrlOf(code);
+        return stored == null ? null : photoUrlResolver.readObject(stored);
+    }
+
+    /** 站点默认封面图地址（前端构建产物里的图标，可匿名直连、无需跳转） */
+    public String defaultImageUrl() {
+        return defaultImage();
     }
 
     // ============================================================

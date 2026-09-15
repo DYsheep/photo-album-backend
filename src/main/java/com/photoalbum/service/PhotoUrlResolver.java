@@ -66,24 +66,6 @@ public class PhotoUrlResolver {
     }
 
     /**
-     * 按指定有效期解析访问地址（供分享卡片封面这类"需要比页面更长寿"的场景使用）
-     *
-     * 社交平台抓取卡片图后会自行长期缓存，页面级 60 分钟的预签名地址不够用，
-     * 因此单独给出一个较长的有效期（cos.card-presigned-ttl-minutes）。
-     * 公开照片仍返回直链，不产生额外签名开销。
-     */
-    public String resolveWithTtl(String storedUrl, Integer isPrivate, long ttlMinutes) {
-        if (storedUrl == null || storedUrl.isBlank()) {
-            return storedUrl;
-        }
-        String url = storedUrl.startsWith("http") ? storedUrl : accessUrlPrefix + storedUrl;
-        if (!isPrivate(isPrivate) || !isCosUrl(url)) {
-            return url;
-        }
-        return presign(url, ttlMinutes);
-    }
-
-    /**
      * 把对象 ACL 同步为与私密标记一致（私密 → private，公开 → public-read）
      *
      * 上传与切换私密标记时调用；失败只告警不阻断业务（并发或权限不足时仍应能完成业务动作）。
@@ -107,13 +89,53 @@ public class PhotoUrlResolver {
         return privateAclEnabled;
     }
 
-    private String presign(String cosUrl) {
-        return presign(cosUrl, presignedTtlMinutes);
+    /** 对象内容（字节 + MIME 类型） */
+    public record ObjectData(byte[] bytes, String contentType) {
     }
 
-    private String presign(String cosUrl, long ttlMinutes) {
+    /**
+     * 读取对象存储中的对象字节
+     *
+     * 供分享卡片封面使用：社交平台抓取缩略图时**不跟随 302 跳转**，
+     * og:image 必须是一个直接返回图片（200）的同域地址，因此这里由服务端代取字节再直出。
+     * 非对象存储路径（本地 /files/）不支持，返回 null 由调用方退回默认图。
+     */
+    public ObjectData readObject(String storedUrl) {
+        if (storedUrl == null || storedUrl.isBlank() || !isCosUrl(storedUrl)) {
+            return null;
+        }
+        String key = extractKey(storedUrl);
         try {
-            Date expiration = new Date(System.currentTimeMillis() + ttlMinutes * 60_000L);
+            com.qcloud.cos.model.COSObject object = cosClient.getObject(cosBucket, key);
+            java.io.InputStream in = object.getObjectContent();
+            byte[] bytes = in.readAllBytes();
+            String contentType = object.getObjectMetadata() == null
+                    ? null : object.getObjectMetadata().getContentType();
+            // 关闭动作放在读取之后单独处理：COS 的流关闭时会回收 HTTP 连接，
+            // 这一步失败不应该把已经读到的图片一起丢掉（否则卡片会退回默认图）
+            closeQuietly(in);
+            return new ObjectData(bytes, (contentType == null || contentType.isBlank())
+                    ? "image/jpeg" : contentType);
+        } catch (Exception e) {
+            log.warn("对象读取失败（分享卡片封面）: key={}, err={}", key, e.getMessage());
+            return null;
+        }
+    }
+
+    private void closeQuietly(java.io.InputStream in) {
+        if (in == null) {
+            return;
+        }
+        try {
+            in.close();
+        } catch (Exception e) {
+            log.debug("对象流关闭失败（不影响已读取内容）: {}", e.getMessage());
+        }
+    }
+
+    private String presign(String cosUrl) {
+        try {
+            Date expiration = new Date(System.currentTimeMillis() + presignedTtlMinutes * 60_000L);
             GeneratePresignedUrlRequest request =
                     new GeneratePresignedUrlRequest(cosBucket, extractKey(cosUrl));
             request.setExpiration(expiration);
