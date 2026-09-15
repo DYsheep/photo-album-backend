@@ -22,6 +22,18 @@ public class ShareLink {
 
     private Long photoId;
 
+    /** 分享对象类型：photo / collection */
+    private String targetType;
+
+    /** 分享对象 ID（照片或合集） */
+    private Long targetId;
+
+    /** 合集分享是否包含私密照片（0=仅公开 1=包含） */
+    private Integer includePrivate;
+
+    /** 访问口令（BCrypt 哈希；NULL 表示无需口令） */
+    private String accessCode;
+
     /** 到期时间（null = 永久有效） */
     private LocalDateTime expiresAt;
 
