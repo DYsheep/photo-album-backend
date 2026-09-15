@@ -11,6 +11,7 @@ import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
 import com.photoalbum.mapper.PhotoCollectionMapper;
 import com.photoalbum.mapper.PhotoCollectionPhotoMapper;
 import com.photoalbum.mapper.ShareLinkMapper;
+import com.photoalbum.mapper.UserMapper;
 import com.photoalbum.security.AccessPolicy;
 import com.photoalbum.security.CurrentUserSupport;
 import com.photoalbum.service.PhotoUrlResolver;
@@ -47,6 +48,7 @@ public class ShareServiceImpl implements ShareService {
 
     private final ShareLinkMapper shareLinkMapper;
     private final PhotoCollectionMapper collectionMapper;
+    private final UserMapper userMapper;
     private final PhotoCollectionPhotoMapper collectionPhotoMapper;
     private final BCryptPasswordEncoder passwordEncoder = new BCryptPasswordEncoder();
     private final PhotoMapper photoMapper;
@@ -203,6 +205,11 @@ public class ShareServiceImpl implements ShareService {
 
     @Override
     public ShareLinkDTO getByCode(String code) {
+        return getByCode(code, null);
+    }
+
+    @Override
+    public ShareLinkDTO getByCode(String code, String accessCode) {
         if (code == null || code.isBlank()) {
             throw new BusinessException(404, NOT_FOUND);
         }
@@ -217,6 +224,17 @@ public class ShareServiceImpl implements ShareService {
         if (shareLink.getExpiresAt() != null
                 && !shareLink.getExpiresAt().isAfter(LocalDateTime.now())) {
             throw new BusinessException(404, NOT_FOUND);
+        }
+
+        // ===== 合集分享分支 =====
+        if ("collection".equals(shareLink.getTargetType())) {
+            // 口令校验：设置了口令的分享，必须携带正确口令（错误/缺失一律拒绝）
+            if (shareLink.getAccessCode() != null && !shareLink.getAccessCode().isBlank()) {
+                if (accessCode == null || !passwordEncoder.matches(accessCode, shareLink.getAccessCode())) {
+                    throw new BusinessException(403, "访问口令不正确");
+                }
+            }
+            return buildCollectionShareDto(shareLink);
         }
 
         Photo photo = photoMapper.selectById(shareLink.getPhotoId());
@@ -279,7 +297,61 @@ public class ShareServiceImpl implements ShareService {
         log.info("分享链接已删除: id={}, code={}", id, shareLink.getCode());
     }
 
-    @Override
+    /**
+     * 合集分享解析：返回合集信息 + 可见照片列表
+     *
+     * 可见性：includePrivate=1 时取"创建该分享的账号可见的照片"（因此被其 deny 命中的照片不会出现）；
+     *        =0 时仅公开照片。过期与不存在的链接统一 404（在调用处已校验）。
+     */
+    private ShareLinkDTO buildCollectionShareDto(ShareLink shareLink) {
+        com.photoalbum.entity.PhotoCollection collection = collectionMapper.selectById(shareLink.getTargetId());
+        if (collection == null) {
+            throw new BusinessException(404, NOT_FOUND);
+        }
+
+        boolean includePrivate = shareLink.getIncludePrivate() != null && shareLink.getIncludePrivate() == 1;
+        User creator = shareLink.getCreatedBy() != null ? userMapper.selectById(shareLink.getCreatedBy()) : null;
+
+        List<com.photoalbum.entity.PhotoCollectionPhoto> rels = collectionPhotoMapper.selectList(
+                new LambdaQueryWrapper<com.photoalbum.entity.PhotoCollectionPhoto>()
+                        .eq(com.photoalbum.entity.PhotoCollectionPhoto::getCollectionId, collection.getId())
+                        .orderByAsc(com.photoalbum.entity.PhotoCollectionPhoto::getSortOrder));
+
+        java.util.List<com.photoalbum.dto.PhotoDTO> photos = new java.util.ArrayList<>();
+        for (com.photoalbum.entity.PhotoCollectionPhoto rel : rels) {
+            Photo photo = photoMapper.selectById(rel.getPhotoId());
+            if (photo == null) {
+                continue;
+            }
+            if (includePrivate) {
+                // 以创建者视角判定：deny 命中的照片不会出现在分享里
+                if (creator == null || !accessPolicy.canViewPhoto(creator, photo)) {
+                    continue;
+                }
+            } else if (photo.getIsPrivate() != null && photo.getIsPrivate() == 1) {
+                continue;
+            }
+            photos.add(toSharePhotoDTO(photo));
+        }
+
+        ShareLinkDTO dto = buildCollectionDto(shareLink, collection);
+        dto.setPhotos(photos);
+        return dto;
+    }
+
+    /** 分享页展示用的照片 DTO（地址经解析器签发：私密照片用短期预签名） */
+    private com.photoalbum.dto.PhotoDTO toSharePhotoDTO(Photo photo) {
+        com.photoalbum.dto.PhotoDTO dto = new com.photoalbum.dto.PhotoDTO();
+        dto.setId(photo.getId());
+        dto.setTitle(photo.getTitle());
+        dto.setDescription(photo.getDescription());
+        dto.setCategoryId(photo.getCategoryId());
+        dto.setIsPrivate(photo.getIsPrivate());
+        dto.setUrl(photoUrlResolver.resolve(photo.getUrl(), photo.getIsPrivate()));
+        dto.setThumbnailUrl(photoUrlResolver.resolveThumbnail(photo.getThumbnailUrl(), photo.getIsPrivate()));
+        return dto;
+    }
+
     public ShareLinkDTO toDTO(ShareLink shareLink) {
         ShareLinkDTO dto = new ShareLinkDTO();
         dto.setId(shareLink.getId());

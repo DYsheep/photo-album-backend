@@ -11,6 +11,9 @@ import java.util.List;
  */
 public interface ShareService {
 
+    /** 按分享码解析（照片/合集通用）；accessCode 为合集分享的口令，可空 */
+    ShareLinkDTO getByCode(String code, String accessCode);
+
     /**
      * 创建（或更新）合集分享链接
      *

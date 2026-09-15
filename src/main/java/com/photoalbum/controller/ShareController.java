@@ -130,10 +130,28 @@ public class ShareController {
      * 公开访问分享链接
      * GET /api/share/{code}
      */
+    /**
+     * 创建（或更新）合集分享链接
+     *
+     * includePrivate=true 时分享内含私密照片（以创建者可见集为准，扣除其黑名单命中的照片）；
+     * accessCode 可选，设置后访问该链接需携带正确口令。
+     */
+    @PostMapping("/api/admin/share/collection/{collectionId}")
+    @PreAuthorize("hasAuthority('photo:manage')")
+    public Result<ShareLinkDTO> createCollectionShare(@PathVariable Long collectionId,
+            @RequestParam(required = false) String expiresAt,
+            @RequestParam(required = false, defaultValue = "false") Boolean includePrivate,
+            @RequestParam(required = false) String accessCode) {
+        java.time.LocalDateTime expiry = (expiresAt == null || expiresAt.isBlank())
+                ? null : java.time.LocalDateTime.parse(expiresAt.trim());
+        return Result.ok(shareService.createCollectionShare(collectionId, expiry, includePrivate, accessCode));
+    }
+
     @GetMapping("/api/share/{code}")
-    public Result<ShareLinkDTO> getShareLink(@PathVariable String code) {
+    public Result<ShareLinkDTO> getShareLink(@PathVariable String code,
+            @RequestParam(required = false) String accessCode) {
         try {
-            ShareLinkDTO dto = shareService.getByCode(code);
+            ShareLinkDTO dto = shareService.getByCode(code, accessCode);
             return Result.ok(dto);
         } catch (BusinessException e) {
             return Result.fail(e.getCode(), e.getMessage());
