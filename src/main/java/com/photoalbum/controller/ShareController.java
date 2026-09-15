@@ -7,11 +7,17 @@ import com.photoalbum.dto.ShareLinkDTO;
 import com.photoalbum.entity.User;
 import com.photoalbum.security.CurrentUserSupport;
 import com.photoalbum.service.PhotoService;
+import com.photoalbum.service.ShareCardService;
 import com.photoalbum.service.ShareService;
 import lombok.RequiredArgsConstructor;
+import org.springframework.http.CacheControl;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ResponseEntity;
 import org.springframework.security.access.prepost.PreAuthorize;
 import org.springframework.web.bind.annotation.*;
 
+import java.net.URI;
+import java.time.Duration;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeParseException;
@@ -35,6 +41,7 @@ public class ShareController {
 
     private final ShareService shareService;
     private final PhotoService photoService;
+    private final ShareCardService shareCardService;
 
     private String currentUserKey() {
         User current = CurrentUserSupport.getCurrentUser();
@@ -145,6 +152,28 @@ public class ShareController {
         java.time.LocalDateTime expiry = (expiresAt == null || expiresAt.isBlank())
                 ? null : java.time.LocalDateTime.parse(expiresAt.trim());
         return Result.ok(shareService.createCollectionShare(collectionId, expiry, includePrivate, accessCode));
+    }
+
+    /**
+     * 分享卡片封面图
+     * GET /api/share/{code}/cover
+     *
+     * 供社交平台抓取 og:image 使用：分享码本身即凭证，因此无需登录；
+     * 命中不到可用封面时（链接失效、需口令、无可见照片）统一跳到站点默认图，不暴露任何信息。
+     * 返回 302 而不是直接给出地址，是为了让页面里引用的是一个"永不过期"的同域地址
+     * （卡片图可能被平台长期缓存，而预签名地址会过期）。
+     */
+    @GetMapping("/api/share/{code}/cover")
+    public ResponseEntity<Void> shareCover(@PathVariable String code) {
+        String target = shareCardService.coverTargetOf(code);
+        if (target == null || target.isBlank()) {
+            // 理论上不会发生（服务内部有兜底），这里只做防御，避免拼出非法跳转地址
+            return ResponseEntity.notFound().build();
+        }
+        return ResponseEntity.status(HttpStatus.FOUND)
+                .location(URI.create(target))
+                .cacheControl(CacheControl.maxAge(Duration.ofHours(1)).cachePublic())
+                .build();
     }
 
     @GetMapping("/api/share/{code}")

@@ -66,6 +66,24 @@ public class PhotoUrlResolver {
     }
 
     /**
+     * 按指定有效期解析访问地址（供分享卡片封面这类"需要比页面更长寿"的场景使用）
+     *
+     * 社交平台抓取卡片图后会自行长期缓存，页面级 60 分钟的预签名地址不够用，
+     * 因此单独给出一个较长的有效期（cos.card-presigned-ttl-minutes）。
+     * 公开照片仍返回直链，不产生额外签名开销。
+     */
+    public String resolveWithTtl(String storedUrl, Integer isPrivate, long ttlMinutes) {
+        if (storedUrl == null || storedUrl.isBlank()) {
+            return storedUrl;
+        }
+        String url = storedUrl.startsWith("http") ? storedUrl : accessUrlPrefix + storedUrl;
+        if (!isPrivate(isPrivate) || !isCosUrl(url)) {
+            return url;
+        }
+        return presign(url, ttlMinutes);
+    }
+
+    /**
      * 把对象 ACL 同步为与私密标记一致（私密 → private，公开 → public-read）
      *
      * 上传与切换私密标记时调用；失败只告警不阻断业务（并发或权限不足时仍应能完成业务动作）。
@@ -90,8 +108,12 @@ public class PhotoUrlResolver {
     }
 
     private String presign(String cosUrl) {
+        return presign(cosUrl, presignedTtlMinutes);
+    }
+
+    private String presign(String cosUrl, long ttlMinutes) {
         try {
-            Date expiration = new Date(System.currentTimeMillis() + presignedTtlMinutes * 60_000L);
+            Date expiration = new Date(System.currentTimeMillis() + ttlMinutes * 60_000L);
             GeneratePresignedUrlRequest request =
                     new GeneratePresignedUrlRequest(cosBucket, extractKey(cosUrl));
             request.setExpiration(expiration);

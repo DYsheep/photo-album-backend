@@ -43,8 +43,8 @@ public class SecurityConfig {
                 // 放行：登录接口（POST only）+ 静态资源（GET only）
                 .requestMatchers("/api/auth/login", "/api/auth/logout").permitAll()
                 .requestMatchers(HttpMethod.GET, "/files/**").permitAll()
-                // 放行：分享链接的公开访问（仅 GET 查询；创建分享必须登录，见 ShareController）
-                .requestMatchers(HttpMethod.GET, "/api/share/*").permitAll()
+                // 放行：分享链接的公开访问（GET 查询 + 卡片封面；创建分享必须登录，见 ShareController）
+                .requestMatchers(HttpMethod.GET, "/api/share/**").permitAll()
                 // 放行：公开读取接口（照片列表、详情、分类列表、标签、统计、合集、地图）
                 .requestMatchers(
                     org.springframework.http.HttpMethod.GET,

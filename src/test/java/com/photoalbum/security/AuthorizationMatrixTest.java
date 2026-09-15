@@ -70,6 +70,8 @@ class AuthorizationMatrixTest {
     private AuditService auditService;
     @MockBean
     private com.photoalbum.mapper.PhotoMapper photoMapper;
+    @MockBean
+    private ShareCardService shareCardService;
 
     /** 角色定义：匿名 / 普通用户 / 仅上传 / 仅管理 / 管理员 */
     private static final String ANON = "anon";
@@ -93,6 +95,9 @@ class AuthorizationMatrixTest {
         when(userService.previewVisibility(anyLong())).thenReturn(Map.of());
         when(auditService.recent(anyInt())).thenReturn(List.of());
         when(photoMapper.selectList(org.mockito.ArgumentMatchers.any())).thenReturn(List.of());
+        // 卡片封面：返回站点默认图，使接口无需访问数据库即可完成跳转
+        when(shareCardService.coverTargetOf(org.mockito.ArgumentMatchers.anyString()))
+                .thenReturn("https://www.dyframe.art/icons/icon-512.png");
     }
 
     // ============================================================
@@ -115,6 +120,9 @@ class AuthorizationMatrixTest {
                 json("GET", "/api/photos/stats", null, ANY),
                 // 分享
                 json("POST", "/api/share/photo/1", "{}", UPLOAD_OR_MANAGE),
+                // 分享卡片封面：公开读（分享码本身即凭证，供社交平台抓取 og:image）
+                json("GET", "/api/share/AAAAAAAA/cover", null, ANY),
+                // 分享页 /share/{code} 不在本矩阵内：它是返回 HTML 的公开页面，不涉及鉴权
                 json("GET", "/api/admin/share", null, MANAGE),
                 json("DELETE", "/api/admin/share/1", null, MANAGE),
                 // 分类
@@ -225,7 +233,8 @@ class AuthorizationMatrixTest {
             return true;
         }
         String body = result.getResponse().getContentAsString();
-        if (body == null || body.isBlank()) {
+        // 非 JSON 响应（302 跳转、HTML 页面等）不适用"业务码"判定，直接看 HTTP 状态
+        if (body == null || body.isBlank() || !body.trim().startsWith("{")) {
             return status >= 400;
         }
         Result<?> parsed = objectMapper.readValue(body, Result.class);

@@ -61,10 +61,16 @@ cos:
   private-acl-enabled: true
   # 私密照片预签名地址有效期（分钟）
   presigned-ttl-minutes: 60
+  # 分享卡片封面预签名有效期（分钟）：社交平台会长期缓存卡片图，需要比页面级地址更长的有效期
+  card-presigned-ttl-minutes: 10080
 
 # 分享链接配置（生产环境通过环境变量 SHARE_BASE_URL 覆盖）
 share:
   base-url: https://www.dyframe.art
+  # 分享页服务端渲染所用模板（前端构建产物 index.html），后端会替换其中的卡片元数据块。
+  # 留空则依次探测 ../frontend/dist/index.html 与 /opt/photo-album/frontend/dist/index.html；
+  # 前端目录不在默认位置时用环境变量 SHARE_PAGE_TEMPLATE 指定绝对路径。
+  page-template: ${SHARE_PAGE_TEMPLATE:}
 
 # 应用安全相关配置
 app:
