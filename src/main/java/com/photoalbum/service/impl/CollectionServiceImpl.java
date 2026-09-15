@@ -246,6 +246,7 @@ public class CollectionServiceImpl implements CollectionService {
     public CollectionDTO updateCollection(Long id, CollectionDTO dto) {
         // 资源级判定：不可见即不可管理，按"不存在"处理（避免通过响应差异推断资源存在性）
         PhotoCollection collection = requireAccessibleCollection(id);
+        Integer previousPrivate = collection.getIsPrivate();
         if (dto.getName() != null) collection.setName(dto.getName());
         if (dto.getDescription() != null) collection.setDescription(dto.getDescription());
         if (dto.getCoverPhotoId() != null) collection.setCoverPhotoId(dto.getCoverPhotoId());
@@ -259,6 +260,14 @@ public class CollectionServiceImpl implements CollectionService {
         }
         collection.setUpdatedAt(LocalDateTime.now());
         collectionMapper.updateById(collection);
+
+        // 合集被设为私密：合集内照片一并置为私密（单向传播，改回公开不自动放行）
+        boolean becamePrivate = collection.getIsPrivate() != null && collection.getIsPrivate() == 1
+                && (previousPrivate == null || previousPrivate != 1);
+        if (becamePrivate) {
+            int changed = markCollectionPhotosPrivate(collection.getId());
+            log.info("合集 {} 设为私密，级联置私密照片 {} 张", collection.getId(), changed);
+        }
         return toDTO(collection);
     }
 
@@ -277,7 +286,7 @@ public class CollectionServiceImpl implements CollectionService {
     @Transactional
     public void addPhoto(Long collectionId, Long photoId) {
         // 资源级判定：不可见即不可管理（合集与照片都要在调用者可见范围内）
-        requireAccessibleCollection(collectionId);
+        PhotoCollection collection = requireAccessibleCollection(collectionId);
         com.photoalbum.entity.Photo target = photoMapper.selectById(photoId);
         if (target == null || !accessPolicy.canViewPhoto(getCurrentUser(), target)) {
             throw new BusinessException(404, "照片不存在");
@@ -294,6 +303,11 @@ public class CollectionServiceImpl implements CollectionService {
         relation.setPhotoId(photoId);
         relation.setSortOrder(0);
         collectionPhotoMapper.insert(relation);
+
+        // 私密合集：新加入的照片一并置为私密
+        if (collection.getIsPrivate() != null && collection.getIsPrivate() == 1) {
+            markPhotoPrivate(photoId);
+        }
     }
 
     @Override
@@ -305,6 +319,38 @@ public class CollectionServiceImpl implements CollectionService {
         wrapper.eq(PhotoCollectionPhoto::getCollectionId, collectionId)
                 .eq(PhotoCollectionPhoto::getPhotoId, photoId);
         collectionPhotoMapper.delete(wrapper);
+    }
+
+    /** 单张照片置为私密（跳过已是私密的），同时把 COS 对象 ACL 置私有 */
+    private void markPhotoPrivate(Long photoId) {
+        Photo photo = photoMapper.selectById(photoId);
+        if (photo == null || (photo.getIsPrivate() != null && photo.getIsPrivate() == 1)) {
+            return;
+        }
+        Photo update = new Photo();
+        update.setId(photo.getId());
+        update.setIsPrivate(1);
+        photoMapper.updateById(update);
+        photoUrlResolver.applyObjectAcl(photo.getUrl(), 1);
+        photoUrlResolver.applyObjectAcl(photo.getThumbnailUrl(), 1);
+    }
+
+    /**
+     * 私密合集：合集内照片一并置为私密。
+     * 仅单向传播——合集改回公开时不自动放行照片，避免误公开原本单独设为私密的照片。
+     */
+    private int markCollectionPhotosPrivate(Long collectionId) {
+        int changed = 0;
+        for (PhotoCollectionPhoto rel : collectionPhotoMapper.selectList(
+                new LambdaQueryWrapper<PhotoCollectionPhoto>()
+                        .eq(PhotoCollectionPhoto::getCollectionId, collectionId))) {
+            Photo before = photoMapper.selectById(rel.getPhotoId());
+            if (before != null && (before.getIsPrivate() == null || before.getIsPrivate() != 1)) {
+                markPhotoPrivate(rel.getPhotoId());
+                changed++;
+            }
+        }
+        return changed;
     }
 
     /**
