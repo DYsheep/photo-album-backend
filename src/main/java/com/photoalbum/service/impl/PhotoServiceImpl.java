@@ -166,6 +166,10 @@ public class PhotoServiceImpl extends ServiceImpl<PhotoMapper, Photo> implements
     @Override
     public PhotoDTO upload(MultipartFile file, String title, Long categoryId, Long collectionId,
                            String description, String tags, Integer isPrivate) throws Exception {
+        // 私密照片仅限管理员上传（编辑入口同样仅管理员可改，见 updatePhoto）
+        if (isPrivate != null && isPrivate == 1 && !isAdmin()) {
+            throw new BusinessException(403, "仅管理员可上传私密照片");
+        }
         validateFile(file);
 
         String dateDir = LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyy/MM"));
