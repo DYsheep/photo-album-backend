@@ -422,8 +422,8 @@ public class PhotoServiceImpl extends ServiceImpl<PhotoMapper, Photo> implements
             Map<String, Object> item = new HashMap<>();
             item.put("id", p.getId());
             item.put("title", p.getTitle());
-            item.put("url", accessUrlPrefix + p.getUrl());
-            String thumb = p.getThumbnailUrl();
+            item.put("url", photoUrlResolver.resolve(p.getUrl(), p.getIsPrivate()));
+            String thumb = photoUrlResolver.resolveThumbnail(p.getThumbnailUrl(), p.getIsPrivate());
             item.put("thumbnailUrl", (thumb != null && !thumb.isEmpty()) ? (thumb.startsWith("http") ? thumb : accessUrlPrefix + thumb) : null);
             item.put("createdAt", p.getCreatedAt() != null ? p.getCreatedAt().toString() : "");
             // 填充分类名称

@@ -165,7 +165,7 @@ public class ShareServiceImpl implements ShareService {
         ShareLinkDTO dto = toDTO(shareLink);
         dto.setShareUrl(shareBaseUrl + "/share/" + code);
         dto.setPhotoTitle(photo.getTitle());
-        dto.setPhotoUrl(photo.getUrl());
+        dto.setPhotoUrl(photoUrlResolver.resolve(photo.getUrl(), photo.getIsPrivate()));
 
         // 照片详细信息（公开分享页展示用）
         dto.setTitle(photo.getTitle());
