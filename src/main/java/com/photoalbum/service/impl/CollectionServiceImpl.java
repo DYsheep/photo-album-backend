@@ -251,7 +251,12 @@ public class CollectionServiceImpl implements CollectionService {
         if (dto.getCoverPhotoId() != null) collection.setCoverPhotoId(dto.getCoverPhotoId());
         if (dto.getSortOrder() != null) collection.setSortOrder(dto.getSortOrder());
         if (dto.getIsPublished() != null) collection.setIsPublished(dto.getIsPublished());
-        if (dto.getIsPrivate() != null) collection.setIsPrivate(dto.getIsPrivate());
+        // 私密标记仅管理员可设置（非管理员静默忽略，与照片编辑规则保持一致）
+        if (dto.getIsPrivate() != null
+                && com.photoalbum.common.UserRoles.isAdmin(
+                        getCurrentUser() == null ? null : getCurrentUser().getRole())) {
+            collection.setIsPrivate(dto.getIsPrivate());
+        }
         collection.setUpdatedAt(LocalDateTime.now());
         collectionMapper.updateById(collection);
         return toDTO(collection);
