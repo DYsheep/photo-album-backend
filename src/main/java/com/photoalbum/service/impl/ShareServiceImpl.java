@@ -5,7 +5,11 @@ import com.photoalbum.common.BusinessException;
 import com.photoalbum.dto.ShareLinkDTO;
 import com.photoalbum.entity.Photo;
 import com.photoalbum.entity.ShareLink;
+import com.photoalbum.entity.User;
 import com.photoalbum.mapper.PhotoMapper;
+import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
+import com.photoalbum.mapper.PhotoCollectionMapper;
+import com.photoalbum.mapper.PhotoCollectionPhotoMapper;
 import com.photoalbum.mapper.ShareLinkMapper;
 import com.photoalbum.security.AccessPolicy;
 import com.photoalbum.security.CurrentUserSupport;
@@ -42,6 +46,9 @@ public class ShareServiceImpl implements ShareService {
     private static final String NOT_FOUND = "分享链接不存在或已失效";
 
     private final ShareLinkMapper shareLinkMapper;
+    private final PhotoCollectionMapper collectionMapper;
+    private final PhotoCollectionPhotoMapper collectionPhotoMapper;
+    private final BCryptPasswordEncoder passwordEncoder = new BCryptPasswordEncoder();
     private final PhotoMapper photoMapper;
     private final AccessPolicy accessPolicy;
     private final PhotoUrlResolver photoUrlResolver;
@@ -131,6 +138,67 @@ public class ShareServiceImpl implements ShareService {
             throw new BusinessException(400, "分享到期时间必须晚于当前时间");
         }
         return value;
+    }
+
+    @Override
+    public ShareLinkDTO createCollectionShare(Long collectionId, LocalDateTime expiresAt,
+                                             Boolean includePrivate, String accessCode) {
+        com.photoalbum.entity.PhotoCollection collection = collectionMapper.selectById(collectionId);
+        if (collection == null) {
+            throw new BusinessException(404, "合集不存在");
+        }
+        // 只有能管理该合集的账号才能对外分享它（不可见即不可分享）
+        if (!accessPolicy.canManageCollection(CurrentUserSupport.getCurrentUser(), collection)) {
+            throw new BusinessException(404, "合集不存在");
+        }
+
+        LocalDateTime normalizedExpiry = normalizeExpiry(expiresAt);
+        boolean withPrivate = Boolean.TRUE.equals(includePrivate);
+        String encodedCode = (accessCode == null || accessCode.isBlank())
+                ? null : passwordEncoder.encode(accessCode.trim());
+
+        // 同一合集只保留一条链接：已存在则更新有效期/私密开关/口令
+        ShareLink existing = shareLinkMapper.selectOne(new LambdaQueryWrapper<ShareLink>()
+                .eq(ShareLink::getTargetType, "collection")
+                .eq(ShareLink::getTargetId, collectionId));
+        if (existing != null) {
+            existing.setExpiresAt(normalizedExpiry);
+            existing.setIncludePrivate(withPrivate ? 1 : 0);
+            existing.setAccessCode(encodedCode);
+            shareLinkMapper.updateById(existing);
+            log.info("合集分享已更新: collectionId={}, code={}, includePrivate={}, expiresAt={}",
+                    collectionId, existing.getCode(), withPrivate, normalizedExpiry);
+            return buildCollectionDto(existing, collection);
+        }
+
+        ShareLink shareLink = new ShareLink();
+        shareLink.setCode(generateUniqueCode());
+        shareLink.setTargetType("collection");
+        shareLink.setTargetId(collectionId);
+        shareLink.setPhotoId(null);
+        shareLink.setIncludePrivate(withPrivate ? 1 : 0);
+        shareLink.setAccessCode(encodedCode);
+        shareLink.setExpiresAt(normalizedExpiry);
+        shareLink.setCreatedAt(LocalDateTime.now());
+        User creator = CurrentUserSupport.getCurrentUser();
+        shareLink.setCreatedBy(creator != null ? creator.getId() : null);
+        shareLinkMapper.insert(shareLink);
+        log.info("合集分享创建成功: collectionId={}, code={}, includePrivate={}, expiresAt={}",
+                collectionId, shareLink.getCode(), withPrivate, normalizedExpiry);
+        return buildCollectionDto(shareLink, collection);
+    }
+
+    /** 合集分享 DTO 组装（照片列表由解析接口按访问者/创建者可见性填充） */
+    private ShareLinkDTO buildCollectionDto(ShareLink shareLink, com.photoalbum.entity.PhotoCollection collection) {
+        ShareLinkDTO dto = toDTO(shareLink);
+        dto.setTargetType("collection");
+        dto.setCollectionId(collection.getId());
+        dto.setCollectionName(collection.getName());
+        dto.setCollectionDescription(collection.getDescription());
+        dto.setIncludePrivate(shareLink.getIncludePrivate());
+        dto.setRequiresAccessCode(shareLink.getAccessCode() != null && !shareLink.getAccessCode().isBlank());
+        dto.setShareUrl(shareBaseUrl + "/share/" + shareLink.getCode());
+        return dto;
     }
 
     @Override

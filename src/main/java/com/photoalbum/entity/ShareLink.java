@@ -37,6 +37,9 @@ public class ShareLink {
     /** 到期时间（null = 永久有效） */
     private LocalDateTime expiresAt;
 
+    /** 创建人用户 ID（合集分享可见性判定依据） */
+    private Long createdBy;
+
     @TableField(fill = FieldFill.INSERT)
     private LocalDateTime createdAt;
 }

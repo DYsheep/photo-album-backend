@@ -10,6 +10,23 @@ import java.time.LocalDateTime;
 @Data
 public class ShareLinkDTO {
 
+    /** 分享对象类型：photo / collection（前端据此分派渲染） */
+    private String targetType;
+
+    /** 合集分享：合集 ID / 名称 / 描述 */
+    private Long collectionId;
+    private String collectionName;
+    private String collectionDescription;
+
+    /** 合集分享：是否包含私密照片 */
+    private Integer includePrivate;
+
+    /** 是否需要访问口令（不返回哈希本身） */
+    private Boolean requiresAccessCode;
+
+    /** 合集分享：照片列表（照片分享时为空） */
+    private java.util.List<PhotoDTO> photos;
+
     private Long id;
 
     private String code;

@@ -12,6 +12,17 @@ import java.util.List;
 public interface ShareService {
 
     /**
+     * 创建（或更新）合集分享链接
+     *
+     * @param collectionId   合集 ID（调用者需具备该合集的管理权限）
+     * @param expiresAt      到期时间（null=永久）
+     * @param includePrivate 是否包含私密照片（true 时以调用者可见集为准并扣除 deny）
+     * @param accessCode     访问口令（可为空）
+     */
+    ShareLinkDTO createCollectionShare(Long collectionId, java.time.LocalDateTime expiresAt,
+                                       Boolean includePrivate, String accessCode);
+
+    /**
      * 为照片创建（或复用并更新）分享链接
      *
      * 同一张照片只保留一条链接：已存在时按本次传入的有效期更新，不新增记录。
