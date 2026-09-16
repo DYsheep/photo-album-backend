@@ -193,6 +193,24 @@ public class ShareController {
     }
 
     /**
+     * 分享页二维码
+     * GET /api/share/{code}/qrcode
+     *
+     * 印在前端生成的分享卡片图上（扫码打开分享页），同样必须 200 直出图片。
+     */
+    @GetMapping("/api/share/{code}/qrcode")
+    public ResponseEntity<byte[]> shareQrCode(@PathVariable String code) {
+        byte[] png = shareCardService.qrcodeOf(code);
+        if (png == null || png.length == 0) {
+            return ResponseEntity.notFound().build();
+        }
+        return ResponseEntity.ok()
+                .contentType(MediaType.IMAGE_PNG)
+                .cacheControl(CacheControl.maxAge(Duration.ofDays(7)).cachePublic())
+                .body(png);
+    }
+
+    /**
      * 管理员查看所有分享链接（需管理权限）
      * GET /api/admin/share
      */

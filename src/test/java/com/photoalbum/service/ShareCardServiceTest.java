@@ -364,6 +364,36 @@ class ShareCardServiceTest {
     }
 
     // ============================================================
+    // qrcodeOf()
+    // ============================================================
+
+    @Nested
+    @DisplayName("qrcodeOf() - 分享页二维码")
+    class QrCodeTests {
+
+        @Test
+        @DisplayName("生成 PNG 图片字节（含合法 PNG 文件头）")
+        void generatesPngBytes() {
+            byte[] png = shareCardService.qrcodeOf("AbCd1234");
+
+            assertThat(png).isNotNull();
+            assertThat(png.length).isGreaterThan(200);
+            assertThat(png[0]).isEqualTo((byte) 0x89);
+            assertThat(png[1]).isEqualTo((byte) 0x50);
+            assertThat(png[2]).isEqualTo((byte) 0x4E);
+            assertThat(png[3]).isEqualTo((byte) 0x47);
+        }
+
+        @Test
+        @DisplayName("只对页面地址编码，不查库；分享码为空也能生成")
+        void doesNotTouchDatabase() {
+            assertThat(shareCardService.qrcodeOf("")).isNotNull();
+
+            verifyNoInteractions(shareLinkMapper, photoMapper, collectionMapper);
+        }
+    }
+
+    // ============================================================
     // 辅助方法
     // ============================================================
 

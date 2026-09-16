@@ -103,6 +103,13 @@
             <version>2.19.0</version>
         </dependency>
 
+        <!-- 二维码生成（分享卡片图上印二维码，扫码即可打开分享） -->
+        <dependency>
+            <groupId>com.google.zxing</groupId>
+            <artifactId>core</artifactId>
+            <version>3.5.3</version>
+        </dependency>
+
         <!-- 数据库迁移（Flyway）：结构变更纳入版本管理，随应用启动自动执行 -->
         <dependency>
             <groupId>org.flywaydb</groupId>

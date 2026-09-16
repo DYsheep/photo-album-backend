@@ -12,6 +12,11 @@ import com.photoalbum.mapper.PhotoCollectionPhotoMapper;
 import com.photoalbum.mapper.PhotoMapper;
 import com.photoalbum.mapper.ShareLinkMapper;
 import com.photoalbum.mapper.UserMapper;
+import com.google.zxing.BarcodeFormat;
+import com.google.zxing.EncodeHintType;
+import com.google.zxing.common.BitMatrix;
+import com.google.zxing.qrcode.QRCodeWriter;
+import com.google.zxing.qrcode.decoder.ErrorCorrectionLevel;
 import com.photoalbum.security.AccessPolicy;
 import com.photoalbum.security.CurrentUserSupport;
 import lombok.RequiredArgsConstructor;
@@ -19,9 +24,15 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
+import javax.imageio.ImageIO;
+import java.awt.image.BufferedImage;
+import java.io.ByteArrayOutputStream;
+import java.nio.charset.StandardCharsets;
 import java.time.LocalDateTime;
 import java.util.ArrayList;
+import java.util.EnumMap;
 import java.util.List;
+import java.util.Map;
 
 /**
  * 分享卡片服务：为"分享链接被转发到社交平台"生成卡片元数据
@@ -44,6 +55,11 @@ public class ShareCardService {
 
     /** 兜底封面：站点图标（随前端一起发布，始终可匿名访问） */
     private static final String DEFAULT_ICON_PATH = "/icons/icon-512.png";
+
+    /** 二维码边长（像素）与配色（深色用站点主色，扫描兼容性不受影响） */
+    private static final int QR_SIZE = 320;
+    private static final int QR_DARK_RGB = 0xFF1A1A2E;
+    private static final int QR_LIGHT_RGB = 0xFFFFFFFF;
 
     private static final String TITLE_EXPIRED = "分享链接已失效";
     private static final String DESC_EXPIRED = "该分享不存在或已过期，请向分享者索取新的链接";
@@ -128,6 +144,37 @@ public class ShareCardService {
     /** 站点默认封面图地址（前端构建产物里的图标，可匿名直连、无需跳转） */
     public String defaultImageUrl() {
         return defaultImage();
+    }
+
+    /**
+     * 分享页二维码（PNG 字节）
+     *
+     * 印在分享卡片图上：图片被转发到微信后，对方扫码即可打开这个分享页。
+     * 只对页面地址编码，不查库、不涉及任何内容，因此任何分享码都能生成。
+     */
+    public byte[] qrcodeOf(String code) {
+        try {
+            Map<EncodeHintType, Object> hints = new EnumMap<>(EncodeHintType.class);
+            hints.put(EncodeHintType.CHARACTER_SET, StandardCharsets.UTF_8.name());
+            hints.put(EncodeHintType.ERROR_CORRECTION, ErrorCorrectionLevel.M);
+            hints.put(EncodeHintType.MARGIN, 1);
+
+            BitMatrix matrix = new QRCodeWriter()
+                    .encode(pageUrl(code), BarcodeFormat.QR_CODE, QR_SIZE, QR_SIZE, hints);
+            BufferedImage image = new BufferedImage(matrix.getWidth(), matrix.getHeight(),
+                    BufferedImage.TYPE_INT_RGB);
+            for (int x = 0; x < matrix.getWidth(); x++) {
+                for (int y = 0; y < matrix.getHeight(); y++) {
+                    image.setRGB(x, y, matrix.get(x, y) ? QR_DARK_RGB : QR_LIGHT_RGB);
+                }
+            }
+            ByteArrayOutputStream out = new ByteArrayOutputStream();
+            ImageIO.write(image, "png", out);
+            return out.toByteArray();
+        } catch (Exception e) {
+            log.warn("分享二维码生成失败: code={}, err={}", code, e.getMessage());
+            return null;
+        }
     }
 
     // ============================================================
