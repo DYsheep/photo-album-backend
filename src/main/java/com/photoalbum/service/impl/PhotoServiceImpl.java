@@ -6,6 +6,7 @@ import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
 import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
 import com.photoalbum.common.BusinessException;
 import com.photoalbum.common.UserRoles;
+import com.photoalbum.config.MybatisPlusConfig;
 import com.photoalbum.dto.PhotoDTO;
 import com.photoalbum.entity.Category;
 import com.photoalbum.entity.Photo;
@@ -91,6 +92,9 @@ public class PhotoServiceImpl extends ServiceImpl<PhotoMapper, Photo> implements
     @Value("${file.max-size-mb:10}")
     private int maxSizeMb = 10;
 
+    /** 默认每页条数（pageNum / pageSize 未传或取值非法时使用） */
+    private static final int DEFAULT_PAGE_SIZE = 10;
+
     /**
      * 扩展名 → 服务端认定的内容类型（不采信客户端提交的 Content-Type）
      */
@@ -121,10 +125,13 @@ public class PhotoServiceImpl extends ServiceImpl<PhotoMapper, Photo> implements
 
     /**
      * 分页查询
+     *
+     * 入参收敛（修复 H01 的第二个面）：页码与每页条数都由本方法限制在合法区间，
+     * 不能只依赖前端传值。分页拦截器负责生成 LIMIT，本方法负责让入参无法绕过它。
      */
     @Override
     public Object getPhotoPage(PhotoDTO dto) {
-        Page<Photo> page = new Page<>(dto.getPageNum(), dto.getPageSize());
+        Page<Photo> page = new Page<>(normalizePageNum(dto.getPageNum()), normalizePageSize(dto.getPageSize()));
 
         LambdaQueryWrapper<Photo> wrapper = new LambdaQueryWrapper<>();
 
@@ -158,6 +165,29 @@ public class PhotoServiceImpl extends ServiceImpl<PhotoMapper, Photo> implements
         data.put("pageNum", result.getCurrent());
         data.put("pageSize", result.getSize());
         return data;
+    }
+
+    /**
+     * 收敛页码：非正数一律回到第 1 页
+     *
+     * MyBatis-Plus 的页码从 1 开始，0 或负数会算出非法偏移量（表现为 SQL 异常或返回空）。
+     */
+    private int normalizePageNum(Integer pageNum) {
+        return (pageNum == null || pageNum < 1) ? 1 : pageNum;
+    }
+
+    /**
+     * 收敛每页条数：限制在 [1, MybatisPlusConfig.MAX_PAGE_SIZE]
+     *
+     * 下界必须收到 1，不能只设上限：MyBatis-Plus 的语义是 **size < 0 表示不分页**，
+     * 若放行 pageSize=-1，等于绕过刚注册的分页拦截器、重新变成一次返回全表。
+     * 上界与拦截器的 maxLimit 共用同一常量，避免两处取值漂移。
+     */
+    private int normalizePageSize(Integer pageSize) {
+        if (pageSize == null || pageSize < 1) {
+            return DEFAULT_PAGE_SIZE;
+        }
+        return Math.min(pageSize, MybatisPlusConfig.MAX_PAGE_SIZE);
     }
 
     /**
