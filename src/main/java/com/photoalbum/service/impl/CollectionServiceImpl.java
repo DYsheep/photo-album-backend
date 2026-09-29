@@ -367,37 +367,72 @@ public class CollectionServiceImpl implements CollectionService {
         return thumb != null ? thumb : photoUrlResolver.resolve(photo.getUrl(), photo.getIsPrivate());
     }
 
+    /**
+     * 封面地址：优先用显式指定的封面照片，其次用合集内排序最靠前的一张**可见**照片。
+     *
+     * 安全要求（修复 S01）：封面地址由 PhotoUrlResolver 签发，而解析器对私密照片会生成短期预签名地址，
+     * 因此**必须先做可见性判定再输出**。此前的实现只取“封面照片或合集内排序第一张”的序号、
+     * 不判可见性，导致匿名访问者请求公开合集列表时即可拿到私密照片的可用预签名地址。
+     * 两张都不可见时返回 null，由前端回退站点默认图。
+     */
+    private String coverUrlOf(PhotoCollection collection) {
+        User user = getCurrentUser();
+
+        if (collection.getCoverPhotoId() != null) {
+            Photo cover = photoMapper.selectById(collection.getCoverPhotoId());
+            if (cover != null && accessPolicy.canViewPhoto(user, cover)) {
+                return coverUrlOf(cover);
+            }
+        }
+
+        Photo first = firstVisiblePhotoIn(collection.getId(), user);
+        return first == null ? null : coverUrlOf(first);
+    }
+
+    /**
+     * 合集内对调用者可见、且按合集排序最靠前的一张照片
+     *
+     * 可见性条件复用 AccessPolicy（与照片列表、合集详情同一口径），
+     * 排序依据在关联表上，需要相关子查询，故用 last() 追加一条 ORDER BY。
+     * 子查询内引用的 t_photo 即主表名（与 AccessPolicy 注入条件所用别名一致），
+     * 全程单次查询，不按合集内照片数逐张加载。
+     */
+    private Photo firstVisiblePhotoIn(Long collectionId, User user) {
+        if (collectionId == null) {
+            return null;
+        }
+        LambdaQueryWrapper<Photo> wrapper = new LambdaQueryWrapper<Photo>()
+                .inSql(Photo::getId, "SELECT photo_id FROM t_collection_photos WHERE collection_id = " + collectionId);
+        accessPolicy.applyPhotoFilter(wrapper, user);
+        wrapper.last("ORDER BY (SELECT MIN(cp.sort_order) FROM t_collection_photos cp"
+                + " WHERE cp.photo_id = t_photo.id) ASC LIMIT 1");
+        return photoMapper.selectOne(wrapper);
+    }
+
     private CollectionDTO toDTO(PhotoCollection collection) {
+        User user = getCurrentUser();
         CollectionDTO dto = new CollectionDTO();
         dto.setId(collection.getId());
         dto.setName(collection.getName());
         dto.setDescription(collection.getDescription());
-        dto.setCoverPhotoId(collection.getCoverPhotoId());
         dto.setSortOrder(collection.getSortOrder());
         dto.setIsPublished(collection.getIsPublished());
         dto.setIsPrivate(collection.getIsPrivate());
-        // 统计照片数
-        LambdaQueryWrapper<PhotoCollectionPhoto> wrapper = new LambdaQueryWrapper<>();
-        wrapper.eq(PhotoCollectionPhoto::getCollectionId, collection.getId());
+        // 统计照片数（与封面一样复用同一套可见性判定，避免暴露隐藏照片的数量）
         dto.setPhotoCount(countVisiblePhotos(collection.getId()));
-        // 封面 URL（没设封面时用合集第一张照片）
-        if (collection.getCoverPhotoId() != null) {
-            Photo cover = photoMapper.selectById(collection.getCoverPhotoId());
-            if (cover != null) {
-                dto.setCoverUrl(coverUrlOf(cover));
-            }
-        }
-        if (dto.getCoverUrl() == null) {
-            LambdaQueryWrapper<PhotoCollectionPhoto> firstPw = new LambdaQueryWrapper<>();
-            firstPw.eq(PhotoCollectionPhoto::getCollectionId, collection.getId())
-                    .orderByAsc(PhotoCollectionPhoto::getSortOrder).last("LIMIT 1");
-            PhotoCollectionPhoto first = collectionPhotoMapper.selectOne(firstPw);
-            if (first != null) {
-                Photo firstPhoto = photoMapper.selectById(first.getPhotoId());
-                if (firstPhoto != null) {
-                    dto.setCoverUrl(coverUrlOf(firstPhoto));
-                }
-            }
+
+        // 封面：显式封面仅在“该照片对调用者可见”时才对外输出。
+        // coverPhotoId 与 coverUrl 一并收敛——否则仅凭 ID 即可确认某张私密照片的存在（修复 S01）
+        Photo cover = collection.getCoverPhotoId() == null
+                ? null : photoMapper.selectById(collection.getCoverPhotoId());
+        boolean coverVisible = cover != null && accessPolicy.canViewPhoto(user, cover);
+        dto.setCoverPhotoId(coverVisible ? collection.getCoverPhotoId() : null);
+
+        if (coverVisible) {
+            dto.setCoverUrl(coverUrlOf(cover));
+        } else {
+            Photo first = firstVisiblePhotoIn(collection.getId(), user);
+            dto.setCoverUrl(first == null ? null : coverUrlOf(first));
         }
         return dto;
     }
