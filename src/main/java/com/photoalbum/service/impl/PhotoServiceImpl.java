@@ -916,15 +916,23 @@ public class PhotoServiceImpl extends ServiceImpl<PhotoMapper, Photo> implements
     /**
      * 点赞照片，返回最新点赞数
      *
-     * 使用 SQL 原子自增：此前的"读-改-写"在并发点赞时会丢更新。
+     * 使用 SQL 原子自增：此前的“读-改-写”在并发点赞时会丢更新。
+     *
+     * 可见性前置判定（修复 M01）：点赞接口对匿名开放，若不做判定，
+     * 私密照片会变成一个“存在性预言机”——能点赞即说明该 ID 存在，
+     * 而照片详情接口对这些照片刻意返回 404；同时匿名者也能给不可见照片刷量。
+     * 不可见与不存在统一按 404 处理，与详情接口口径一致，不暴露资源存在性。
      */
     public int likePhoto(Long id) {
+        if (getVisiblePhoto(id) == null) {
+            throw new BusinessException(404, "照片不存在");
+        }
         photoMapper.update(null, new LambdaUpdateWrapper<Photo>()
                 .setSql("like_count = COALESCE(like_count, 0) + 1")
                 .eq(Photo::getId, id));
         Photo photo = photoMapper.selectById(id);
         if (photo == null) {
-            throw new BusinessException("照片不存在");
+            throw new BusinessException(404, "照片不存在");
         }
         return photo.getLikeCount() == null ? 0 : photo.getLikeCount();
     }
