@@ -5,6 +5,7 @@ import com.photoalbum.common.RateLimiter;
 import com.photoalbum.common.Result;
 import com.photoalbum.dto.ShareLinkDTO;
 import com.photoalbum.entity.User;
+import com.photoalbum.security.ClientIpResolver;
 import com.photoalbum.security.CurrentUserSupport;
 import com.photoalbum.service.PhotoService;
 import com.photoalbum.service.PhotoUrlResolver;
@@ -41,9 +42,24 @@ public class ShareController {
     private static final long SHARE_WINDOW_MS = 3_600_000L;
     private static final long SHARE_LOCK_MS = 600_000L;
 
+    /**
+     * 分享访问限流：同一「分享码 + 来源地址」5 分钟内最多 5 次，超限锁定 15 分钟
+     *
+     * 访问校验本质是凭据比对（与登录同类），必须限制尝试次数：服务端以 BCrypt 校验口令，
+     * 单次仅数十毫秒，不限流时短口令可被高速穷举（修复 H02）。
+     */
+    private static final int ACCESS_MAX_ATTEMPTS = 5;
+
+    /** 来源维度上限：防止同一来源轮询大量分享码 */
+    private static final int ACCESS_IP_MAX_ATTEMPTS = 30;
+
+    private static final long ACCESS_WINDOW_MS = 300_000L;
+    private static final long ACCESS_LOCK_MS = 900_000L;
+
     private final ShareService shareService;
     private final PhotoService photoService;
     private final ShareCardService shareCardService;
+    private final ClientIpResolver clientIpResolver;
 
     private String currentUserKey() {
         User current = CurrentUserSupport.getCurrentUser();
@@ -183,13 +199,37 @@ public class ShareController {
 
     @GetMapping("/api/share/{code}")
     public Result<ShareLinkDTO> getShareLink(@PathVariable String code,
-            @RequestParam(required = false) String accessCode) {
+            @RequestParam(required = false) String accessCode,
+            jakarta.servlet.http.HttpServletRequest request) {
+        // 先限流再比对：口令校验属凭据比对，限流缺失时短口令可被高速穷举（修复 H02）
+        if (!allowShareAccess(code, request)) {
+            return Result.fail(429, "尝试次数过多，请15分钟后再试");
+        }
         try {
             ShareLinkDTO dto = shareService.getByCode(code, accessCode);
             return Result.ok(dto);
         } catch (BusinessException e) {
             return Result.fail(e.getCode(), e.getMessage());
         }
+    }
+
+    /**
+     * 分享访问是否放行（双维度：分享码+来源、以及来源单独一档）
+     *
+     * 两个计数都无条件累加，与登录限流同一写法；否则其中一个已锁定时另一个就不再计数。
+     * 键中带来源地址而不是只带分享码：只按分享码限流会让任何人用一个来源就锁死他人链接的访问，
+     * 相当于把自己的防护变成对他人的拒绝服务。
+     */
+    private boolean allowShareAccess(String code, jakarta.servlet.http.HttpServletRequest request) {
+        String ip = clientIpResolver.resolve(request);
+        String normalizedCode = code == null ? "" : code.trim();
+        boolean byCode = RateLimiter.tryAcquire(
+                "share-access:code:" + normalizedCode + ":" + ip,
+                ACCESS_MAX_ATTEMPTS, ACCESS_WINDOW_MS, ACCESS_LOCK_MS);
+        boolean byIp = RateLimiter.tryAcquire(
+                "share-access:ip:" + ip,
+                ACCESS_IP_MAX_ATTEMPTS, ACCESS_WINDOW_MS, ACCESS_LOCK_MS);
+        return byCode && byIp;
     }
 
     /**

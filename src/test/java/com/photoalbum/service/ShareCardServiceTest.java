@@ -172,29 +172,31 @@ class ShareCardServiceTest {
         }
 
         @Test
-        @DisplayName("含私密的合集分享：以创建者视角计数，被 deny 的照片既不计入也不作封面")
-        void includePrivateUsesCreatorScope() {
+        @DisplayName("历史遗留链接（含私密但无口令）：按不含私密处理，私密照片既不计入也不作封面")
+        void legacyPrivateShareWithoutCodeIsDowngraded() {
+            // 修复 H03 的运行期兜底：本次修复上线前可能存在 include_private=1 且未设口令的链接，
+            // 它们不能继续经本接口把私密照片的对象地址对外输出
             ShareLink link = collectionLink(8L, true, null);
             link.setCreatedBy(1L);
             when(shareLinkMapper.selectOne(any(LambdaQueryWrapper.class))).thenReturn(link);
             PhotoCollection collection = new PhotoCollection();
             collection.setId(8L);
-            collection.setName("我们的饭");
+            collection.setName("含私密的合集");
+            collection.setCoverPhotoId(10L);   // 封面被指定为私密照片
             when(collectionMapper.selectById(8L)).thenReturn(collection);
             when(collectionPhotoMapper.selectList(any(LambdaQueryWrapper.class)))
-                    .thenReturn(List.of(rel(8L, 10L), rel(8L, 11L)));
-            when(userMapper.selectById(1L)).thenReturn(new User());
+                    .thenReturn(List.of(rel(8L, 10L), rel(8L, 22L)));
             when(photoMapper.selectById(10L)).thenReturn(photo(10L, 1, "p10"));
-            when(photoMapper.selectById(11L)).thenReturn(photo(11L, 1, "p11"));
-            // 创建者可见 10 号，11 号被其 deny
-            when(accessPolicy.canViewPhoto(any(), any())).thenAnswer(inv ->
-                    ((Photo) inv.getArgument(1)).getId().equals(10L));
+            when(photoMapper.selectById(22L)).thenReturn(photo(22L, 0, "p22"));
 
             ShareCard card = shareCardService.cardOf("Coll1234");
 
             assertThat(card.description()).isEqualTo("共 1 张照片");
+            // 封面必须回退到公开照片，绝不能是私密照片的对象地址
             assertThat(shareCardService.coverStoredUrlOf("Coll1234"))
-                    .isEqualTo("https://cos.example.com/p10_thumb.jpg");
+                    .isEqualTo("https://cos.example.com/p22_thumb.jpg");
+            // 无口令即不进入"创建者视角"分支，故不需要查询创建者
+            verifyNoInteractions(userMapper);
         }
 
         @Test

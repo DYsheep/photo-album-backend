@@ -14,6 +14,7 @@ import com.photoalbum.mapper.ShareLinkMapper;
 import com.photoalbum.mapper.UserMapper;
 import com.photoalbum.security.AccessPolicy;
 import com.photoalbum.security.CurrentUserSupport;
+import com.photoalbum.security.ShareLinkPolicy;
 import com.photoalbum.service.PhotoUrlResolver;
 import com.photoalbum.service.ShareService;
 import lombok.RequiredArgsConstructor;
@@ -45,6 +46,15 @@ public class ShareServiceImpl implements ShareService {
     private static final int MAX_RETRY = 10;
 
     private static final String NOT_FOUND = "分享链接不存在或已失效";
+
+    /** 访问口令最小长度 */
+    private static final int MIN_ACCESS_CODE_LENGTH = 6;
+
+    /** 含私密内容的分享：未指定有效期时的默认有效期（天） */
+    private static final int DEFAULT_PRIVATE_SHARE_DAYS = 30;
+
+    /** 含私密内容的分享：有效期上限（天） */
+    private static final int MAX_PRIVATE_SHARE_DAYS = 90;
 
     private final ShareLinkMapper shareLinkMapper;
     private final PhotoCollectionMapper collectionMapper;
@@ -142,6 +152,40 @@ public class ShareServiceImpl implements ShareService {
         return value;
     }
 
+    /**
+     * 访问口令强度校验（修复 H02 的第二个面）
+     *
+     * 口令是分享唯一的访问门槛，而访问校验接口没有账号维度（只按分享码与来源地址限流），
+     * 因此弱口令——尤其短纯数字——在换 IP 的分布式尝试下仍可能被穷举。
+     */
+    private void validateAccessCodeStrength(String accessCode) {
+        if (accessCode.length() < MIN_ACCESS_CODE_LENGTH) {
+            throw new BusinessException(400, "访问口令至少 " + MIN_ACCESS_CODE_LENGTH + " 位");
+        }
+        if (accessCode.chars().allMatch(Character::isDigit)) {
+            throw new BusinessException(400, "访问口令不能为纯数字，请混合字母或符号");
+        }
+    }
+
+    /**
+     * 收敛含私密内容分享的有效期（修复 H03 的第二个面）
+     *
+     * 未指定时给安全默认值（DEFAULT_PRIVATE_SHARE_DAYS 天）而非“永久有效”——
+     * 私密内容的访问窗口不应由默认值决定为无限；显式指定但超过上限时直接拒绝，
+     * 而不是静默截断，使调用方明确知道边界所在。
+     */
+    private LocalDateTime boundPrivateShareExpiry(LocalDateTime expiry) {
+        LocalDateTime now = LocalDateTime.now();
+        if (expiry == null) {
+            return now.plusDays(DEFAULT_PRIVATE_SHARE_DAYS);
+        }
+        if (expiry.isAfter(now.plusDays(MAX_PRIVATE_SHARE_DAYS))) {
+            throw new BusinessException(400,
+                    "含私密内容的分享有效期不得超过 " + MAX_PRIVATE_SHARE_DAYS + " 天");
+        }
+        return expiry;
+    }
+
     @Override
     public ShareLinkDTO createCollectionShare(Long collectionId, LocalDateTime expiresAt,
                                              Boolean includePrivate, String accessCode) {
@@ -156,8 +200,25 @@ public class ShareServiceImpl implements ShareService {
 
         LocalDateTime normalizedExpiry = normalizeExpiry(expiresAt);
         boolean withPrivate = Boolean.TRUE.equals(includePrivate);
-        String encodedCode = (accessCode == null || accessCode.isBlank())
-                ? null : passwordEncoder.encode(accessCode.trim());
+        String trimmedCode = accessCode == null ? null : accessCode.trim();
+
+        // 口令强度：只要设置了口令就要达标（口令是该分享唯一的访问门槛）
+        if (trimmedCode != null && !trimmedCode.isEmpty()) {
+            validateAccessCodeStrength(trimmedCode);
+        }
+        // 含私密必须设口令。否则拿到分享码的人（分享码随二维码与卡片转发扩散）
+        // 即可经分享接口与卡片封面接口取到私密照片内容——封面接口由服务端代取对象字节，
+        // 不受对象级私有 ACL 约束（修复 H03）
+        if (withPrivate && (trimmedCode == null || trimmedCode.isEmpty())) {
+            throw new BusinessException(400, "分享私密内容必须设置访问口令");
+        }
+        // 含私密时收敛有效期：不默认永久有效（修复 H03）
+        if (withPrivate) {
+            normalizedExpiry = boundPrivateShareExpiry(normalizedExpiry);
+        }
+
+        String encodedCode = (trimmedCode == null || trimmedCode.isEmpty())
+                ? null : passwordEncoder.encode(trimmedCode);
 
         // 同一合集只保留一条链接：已存在则更新有效期/私密开关/口令
         ShareLink existing = shareLinkMapper.selectOne(new LambdaQueryWrapper<ShareLink>()
@@ -197,8 +258,8 @@ public class ShareServiceImpl implements ShareService {
         dto.setCollectionId(collection.getId());
         dto.setCollectionName(collection.getName());
         dto.setCollectionDescription(collection.getDescription());
-        dto.setIncludePrivate(shareLink.getIncludePrivate());
-        dto.setRequiresAccessCode(shareLink.getAccessCode() != null && !shareLink.getAccessCode().isBlank());
+        dto.setIncludePrivate(ShareLinkPolicy.effectiveIncludePrivate(shareLink) ? 1 : 0);
+        dto.setRequiresAccessCode(ShareLinkPolicy.hasAccessCode(shareLink));
         dto.setShareUrl(shareBaseUrl + "/share/" + shareLink.getCode());
         return dto;
     }
@@ -229,7 +290,7 @@ public class ShareServiceImpl implements ShareService {
         // ===== 合集分享分支 =====
         if ("collection".equals(shareLink.getTargetType())) {
             // 口令校验：设置了口令的分享，必须携带正确口令（错误/缺失一律拒绝）
-            if (shareLink.getAccessCode() != null && !shareLink.getAccessCode().isBlank()) {
+            if (ShareLinkPolicy.hasAccessCode(shareLink)) {
                 if (accessCode == null || !passwordEncoder.matches(accessCode, shareLink.getAccessCode())) {
                     throw new BusinessException(403, "访问口令不正确");
                 }
@@ -315,7 +376,8 @@ public class ShareServiceImpl implements ShareService {
             throw new BusinessException(404, NOT_FOUND);
         }
 
-        boolean includePrivate = shareLink.getIncludePrivate() != null && shareLink.getIncludePrivate() == 1;
+        // 运行期兜底：无口令的历史链接一律不含私密（见 ShareLinkPolicy）
+        boolean includePrivate = ShareLinkPolicy.effectiveIncludePrivate(shareLink);
         User creator = shareLink.getCreatedBy() != null ? userMapper.selectById(shareLink.getCreatedBy()) : null;
 
         List<com.photoalbum.entity.PhotoCollectionPhoto> rels = collectionPhotoMapper.selectList(
@@ -365,7 +427,7 @@ public class ShareServiceImpl implements ShareService {
         dto.setPhotoId(shareLink.getPhotoId());
         dto.setTargetType(shareLink.getTargetType());
         dto.setTargetId(shareLink.getTargetId());
-        dto.setIncludePrivate(shareLink.getIncludePrivate());
+        dto.setIncludePrivate(ShareLinkPolicy.effectiveIncludePrivate(shareLink) ? 1 : 0);
         dto.setCreatedAt(shareLink.getCreatedAt());
         dto.setExpiresAt(shareLink.getExpiresAt());
         dto.setExpired(shareLink.getExpiresAt() != null

@@ -19,6 +19,7 @@ import com.google.zxing.qrcode.QRCodeWriter;
 import com.google.zxing.qrcode.decoder.ErrorCorrectionLevel;
 import com.photoalbum.security.AccessPolicy;
 import com.photoalbum.security.CurrentUserSupport;
+import com.photoalbum.security.ShareLinkPolicy;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
@@ -89,7 +90,7 @@ public class ShareCardService {
             return new ShareCard(TITLE_EXPIRED, DESC_EXPIRED, defaultImage(), pageUrl(code));
         }
         // 需口令：不泄露标题与封面（拿到链接的人未必知道口令）
-        if (hasAccessCode(link)) {
+        if (ShareLinkPolicy.hasAccessCode(link)) {
             return new ShareCard(TITLE_PROTECTED, DESC_PROTECTED, defaultImage(), pageUrl(code));
         }
 
@@ -123,7 +124,7 @@ public class ShareCardService {
      */
     public String coverStoredUrlOf(String code) {
         ShareLink link = findLiveLink(code);
-        if (link == null || hasAccessCode(link)) {
+        if (link == null || ShareLinkPolicy.hasAccessCode(link)) {
             return null;
         }
         Photo cover = coverPhoto(link);
@@ -217,7 +218,9 @@ public class ShareCardService {
      * 否则只保留公开照片。
      */
     private Scan scanCollection(ShareLink link, PhotoCollection collection) {
-        boolean includePrivate = link.getIncludePrivate() != null && link.getIncludePrivate() == 1;
+        // 运行期兜底：无口令的链接一律不含私密（见 ShareLinkPolicy），
+        // 避免本次修复上线前创建的历史链接仍经本接口输出私密照片封面
+        boolean includePrivate = ShareLinkPolicy.effectiveIncludePrivate(link);
         User creator = includePrivate && link.getCreatedBy() != null
                 ? userMapper.selectById(link.getCreatedBy()) : null;
 
@@ -302,10 +305,6 @@ public class ShareCardService {
         }
         return shareBaseUrl.endsWith("/")
                 ? shareBaseUrl.substring(0, shareBaseUrl.length() - 1) : shareBaseUrl;
-    }
-
-    private boolean hasAccessCode(ShareLink link) {
-        return link.getAccessCode() != null && !link.getAccessCode().isBlank();
     }
 
     private String blankToNull(String value) {

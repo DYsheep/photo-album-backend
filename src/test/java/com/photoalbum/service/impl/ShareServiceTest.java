@@ -673,12 +673,25 @@ class ShareServiceTest {
             return photo;
         }
 
+        /** 含私密内容的分享必须带口令（修复 H03），故含私密的用例统一使用这个口令 */
+        private static final String ACCESS_CODE = "share-2026";
+
+        /**
+         * 生成真实的 BCrypt 哈希
+         *
+         * 服务内部用的是真实编码器，写死示例哈希（如 $2a$10$abcdefg...）无法通过 matches 校验。
+         */
+        private static String accessCodeHash() {
+            return new org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder()
+                    .encode(ACCESS_CODE);
+        }
+
         @Test
         @DisplayName("含私密：以创建者视角判定，被其 deny 的照片不出现在分享中")
         void denyPhotoNeverLeaks() {
             Long cid = 8L;
             when(shareLinkMapper.selectOne(any(LambdaQueryWrapper.class)))
-                    .thenReturn(collectionShare(cid, true, null, null));
+                    .thenReturn(collectionShare(cid, true, accessCodeHash(), null));
             com.photoalbum.entity.PhotoCollection collection = new com.photoalbum.entity.PhotoCollection();
             collection.setId(cid);
             collection.setName("我亲爱的你呀");
@@ -692,13 +705,38 @@ class ShareServiceTest {
             when(accessPolicy.canViewPhoto(any(), any())).thenAnswer(inv ->
                     ((Photo) inv.getArgument(1)).getId().equals(10L));
 
-            ShareLinkDTO dto = shareService.getByCode("Coll1234");
+            ShareLinkDTO dto = shareService.getByCode("Coll1234", ACCESS_CODE);
 
             assertNotNull(dto.getPhotos());
             assertEquals(1, dto.getPhotos().size(), "被 deny 的照片不应出现在分享里");
             assertEquals(10L, dto.getPhotos().get(0).getId());
             assertEquals("collection", dto.getTargetType());
             assertEquals("我亲爱的你呀", dto.getCollectionName());
+        }
+
+        @Test
+        @DisplayName("历史遗留链接（含私密但无口令）：降级为不含私密，私密照片一律不返回")
+        void legacyPrivateShareWithoutCodeIsDowngraded() {
+            // 修复 H03 的运行期兜底：本次修复上线前可能存在 include_private=1 且未设口令的链接
+            Long cid = 8L;
+            when(shareLinkMapper.selectOne(any(LambdaQueryWrapper.class)))
+                    .thenReturn(collectionShare(cid, true, null, null));
+            com.photoalbum.entity.PhotoCollection collection = new com.photoalbum.entity.PhotoCollection();
+            collection.setId(cid);
+            collection.setName("历史合集");
+            when(collectionMapper.selectById(cid)).thenReturn(collection);
+            when(collectionPhotoMapper.selectList(any(LambdaQueryWrapper.class))).thenReturn(Arrays.asList(
+                    rel(cid, 30L), rel(cid, 31L)));
+            when(photoMapper.selectById(30L)).thenReturn(photoOf(30L, 1));
+            when(photoMapper.selectById(31L)).thenReturn(photoOf(31L, 0));
+
+            ShareLinkDTO dto = shareService.getByCode("Coll1234");
+
+            assertEquals(1, dto.getPhotos().size(), "无口令时私密照片不得返回");
+            assertEquals(31L, dto.getPhotos().get(0).getId());
+            assertEquals(0, dto.getIncludePrivate(), "响应中的含私密标记也应回落为不含私密");
+            // 关键断言：未进入“按创建者视角判定”的分支，故一次可见性判定都不应发生
+            verify(accessPolicy, never()).canViewPhoto(any(), any());
         }
 
         @Test
