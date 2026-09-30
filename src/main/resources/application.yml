@@ -29,7 +29,12 @@ mybatis-plus:
   type-aliases-package: com.photoalbum.entity
   configuration:
     map-underscore-to-camel-case: true
-    log-impl: org.apache.ibatis.logging.stdout.StdOutImpl
+    # 不配置 log-impl 即使用默认的 NoLoggingImpl（修复 L03）。
+    # 此前用 StdOutImpl 会把每条 SQL 及其参数明文打到标准输出，
+    # 其中包含登录查询的用户名、改密时的 BCrypt 口令哈希与审计详情。
+    # 需要排查 SQL 时临时开启（放进启动参数，不要写回本文件）：
+    #   --mybatis-plus.configuration.log-impl=org.apache.ibatis.logging.stdout.StdOutImpl
+    log-impl: org.apache.ibatis.logging.nologging.NoLoggingImpl
 
 # JWT 配置
 jwt:
@@ -70,6 +75,21 @@ share:
   # 前端目录不在默认位置时用环境变量 SHARE_PAGE_TEMPLATE 指定绝对路径。
   page-template: ${SHARE_PAGE_TEMPLATE:}
 
+# 接口文档（Knife4j / SpringDoc）：生产环境关闭（修复 M02）
+# /doc.html 与 /v3/api-docs 在应用层是放行的。线上目前被 Nginx 的 SPA 通配回退遮蔽、实际不可达，
+# 但那是偶然遮蔽 —— 一旦有人调整 Nginx 的 location 策略把它纳入反向代理，文档会立刻公网可见，
+# 而文档本身会给出全部接口路径与参数结构。故此处从应用层直接关掉，不依赖接入层的巧合。
+# 需要本地查看文档时用启动参数临时开启：
+#   --springdoc.api-docs.enabled=true --springdoc.swagger-ui.enabled=true --knife4j.enable=true
+springdoc:
+  api-docs:
+    enabled: false
+  swagger-ui:
+    enabled: false
+knife4j:
+  enable: false
+  production: true
+
 # 应用安全相关配置
 app:
   cors:
@@ -83,4 +103,5 @@ app:
 # 日志级别
 logging:
   level:
-    com.photoalbum.mapper: debug
+    # 不打开 mapper 的 debug：该级别会逐条打印 SQL 与参数，含口令哈希等敏感值（修复 L03）
+    com.photoalbum.mapper: warn
