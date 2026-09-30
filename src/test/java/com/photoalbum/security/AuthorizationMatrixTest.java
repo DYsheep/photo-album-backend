@@ -116,7 +116,8 @@ class AuthorizationMatrixTest {
                 json("POST", "/api/photos/private-acl/repair", null, MANAGE),
                 json("POST", "/api/photos/1/like", null, ANY),
                 json("GET", "/api/photos/1", null, ANY),
-                json("GET", "/api/photos/stats", null, ANY),
+                // 统计接口只被后台仪表盘调用，匿名可读会泄露站点规模与器材分布等运营数据（修复 M07）
+                json("GET", "/api/photos/stats", null, LOGGED_IN),
                 // 分享
                 json("POST", "/api/share/photo/1", "{}", UPLOAD_OR_MANAGE),
                 // 分享卡片封面：公开读（分享码本身即凭证，供社交平台抓取 og:image）

@@ -45,14 +45,15 @@ public class SecurityConfig {
                 .requestMatchers(HttpMethod.GET, "/files/**").permitAll()
                 // 放行：分享链接的公开访问（GET 查询 + 卡片封面；创建分享必须登录，见 ShareController）
                 .requestMatchers(HttpMethod.GET, "/api/share/**").permitAll()
-                // 放行：公开读取接口（照片列表、详情、分类列表、标签、统计、合集、地图）
+                // 放行：公开读取接口（照片列表、详情、分类列表、标签、合集、地图）
+                // 注意：/api/photos/stats 已从本清单移除（修复 M07）——它只被后台仪表盘调用，
+                // 匿名可读会泄露站点规模、存储用量、器材与年份分布等运营数据，现改为需登录。
                 .requestMatchers(
                     org.springframework.http.HttpMethod.GET,
                     "/api/photos",
                     "/api/photos/*",
                     "/api/photos/*/adjacent",
                     "/api/photos/tags",
-                    "/api/photos/stats",
                     "/api/photos/gps",
                     "/api/categories",
                     "/api/collections",

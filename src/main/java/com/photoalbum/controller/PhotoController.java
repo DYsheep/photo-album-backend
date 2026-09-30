@@ -155,8 +155,13 @@ public class PhotoController {
     /**
      * 仪表盘统计数据
      * GET /api/photos/stats
+     *
+     * 仅登录用户可读（修复 M07）：该接口只被后台仪表盘调用，
+     * 匿名可读会泄露站点规模、存储用量、相机型号与按年拍摄分布等运营数据。
+     * 路径规则已移除放行，这里再加方法级约束，避免日后路径调整时失去保护。
      */
     @GetMapping("/stats")
+    @PreAuthorize("isAuthenticated()")
     public Result<Map<String, Object>> stats() {
         Map<String, Object> data = photoService.getDashboardStats();
         return Result.ok(data);
