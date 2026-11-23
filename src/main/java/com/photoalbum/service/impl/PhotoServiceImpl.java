@@ -54,6 +54,10 @@ import java.awt.image.BufferedImage;
 import java.awt.Graphics2D;
 import java.awt.RenderingHints;
 import javax.imageio.ImageIO;
+import javax.imageio.ImageReadParam;
+import javax.imageio.ImageReader;
+import javax.imageio.ImageWriteParam;
+import javax.imageio.ImageWriter;
 import java.util.LinkedHashSet;
 import java.nio.file.Path;
 import java.nio.file.Paths;
@@ -321,38 +325,126 @@ public class PhotoServiceImpl extends ServiceImpl<PhotoMapper, Photo> implements
                 new ByteArrayInputStream(data), meta));
     }
 
-    private byte[] generateThumbnailBytes(byte[] imageBytes, int maxWidth) {
+    /**
+     * 生成缩略图字节（统一输出 JPEG）
+     *
+     * 三个要点：
+     *  1) **降采样解码**：让解码器直接按 1/2、1/4、1/8 给出较小的位图，而不是先解出全尺寸
+     *     再缩小。一张 2400 万像素的照片全尺寸解码要约 72MB 堆内存，降采样后只要几 MB，
+     *     这是 2G 内存机器上"批量上传失败"的主要诱因；
+     *  2) **不放大**：目标长边取 min(原长边, 上限)。原文写的是
+     *     `if (w <= maxWidth) return imageBytes;`——把小图的原始字节直接当缩略图，
+     *     导致同一份内容在对象存储里存两份、且 Content-Type 一律被标成 image/jpeg。
+     *     现在无论原图多大都重新编码一次，缩略图字段始终是真正的缩略图；
+     *  3) **白底**：透明图（PNG 截图、logo）画到 TYPE_INT_RGB 上默认是黑底，
+     *     先铺白再画。
+     *
+     * 解码失败的格式（如 JDK 不支持的 WebP）返回 null，调用方不设置 thumbnailUrl，
+     * 前端会回退到原图地址。
+     */
+    byte[] generateThumbnailBytes(byte[] imageBytes, int maxEdge) {
         try {
-            BufferedImage original = ImageIO.read(new ByteArrayInputStream(imageBytes));
-            if (original == null) return null;
-            int w = original.getWidth();
-            int h = original.getHeight();
-            if (w <= maxWidth) return imageBytes;
+            DecodedImage decoded = decodeForThumbnail(imageBytes, maxEdge);
+            if (decoded == null || decoded.image() == null) {
+                return null;
+            }
+            int srcWidth = decoded.sourceWidth();
+            int srcHeight = decoded.sourceHeight();
+            int srcLongEdge = Math.max(srcWidth, srcHeight);
+            int targetLongEdge = Math.max(1, Math.min(maxEdge, srcLongEdge));
+            double scale = targetLongEdge / (double) srcLongEdge;
+            int targetWidth = Math.max(1, (int) Math.round(srcWidth * scale));
+            int targetHeight = Math.max(1, (int) Math.round(srcHeight * scale));
 
-            int newW = maxWidth;
-            int newH = (int) (h * ((double) maxWidth / w));
-            BufferedImage thumb = new BufferedImage(newW, newH, BufferedImage.TYPE_INT_RGB);
-            Graphics2D g2d = thumb.createGraphics();
-            g2d.setRenderingHint(RenderingHints.KEY_INTERPOLATION, RenderingHints.VALUE_INTERPOLATION_BICUBIC);
-            g2d.setRenderingHint(RenderingHints.KEY_RENDERING, RenderingHints.VALUE_RENDER_QUALITY);
-            g2d.drawImage(original, 0, 0, newW, newH, null);
-            g2d.dispose();
-
-            // 高质量 JPEG 输出
-            ByteArrayOutputStream out = new ByteArrayOutputStream();
-            javax.imageio.ImageWriter writer = ImageIO.getImageWritersByFormatName("jpeg").next();
-            javax.imageio.plugins.jpeg.JPEGImageWriteParam jpegParams = 
-                (javax.imageio.plugins.jpeg.JPEGImageWriteParam) writer.getDefaultWriteParam();
-            jpegParams.setCompressionMode(javax.imageio.plugins.jpeg.JPEGImageWriteParam.MODE_EXPLICIT);
-            jpegParams.setCompressionQuality(0.85f);
-            writer.setOutput(ImageIO.createImageOutputStream(out));
-            writer.write(null, new javax.imageio.IIOImage(thumb, null, null), jpegParams);
-            writer.dispose();
-            return out.toByteArray();
+            BufferedImage canvas = new BufferedImage(targetWidth, targetHeight, BufferedImage.TYPE_INT_RGB);
+            Graphics2D g2d = canvas.createGraphics();
+            try {
+                // 透明区域按白底处理，避免 PNG 缩略图出现黑底
+                g2d.setColor(java.awt.Color.WHITE);
+                g2d.fillRect(0, 0, targetWidth, targetHeight);
+                g2d.setRenderingHint(RenderingHints.KEY_INTERPOLATION,
+                        RenderingHints.VALUE_INTERPOLATION_BICUBIC);
+                g2d.setRenderingHint(RenderingHints.KEY_RENDERING,
+                        RenderingHints.VALUE_RENDER_QUALITY);
+                g2d.drawImage(decoded.image(), 0, 0, targetWidth, targetHeight, null);
+            } finally {
+                g2d.dispose();
+            }
+            return toJpegBytes(canvas);
         } catch (Exception e) {
             log.warn("缩略图生成失败: {}", e.getMessage());
             return null;
         }
+    }
+
+    /** 解码结果：位图 + 原始尺寸（决定"不放大"的目标尺寸需要原始尺寸） */
+    private record DecodedImage(BufferedImage image, int sourceWidth, int sourceHeight) {
+    }
+
+    /**
+     * 按需降采样解码
+     *
+     * 采样倍数取"仍能让解码尺寸不小于目标长边"的最大 2 的幂，留足余量避免
+     * 按格取样造成的锯齿（例如 6000px 原图、目标 800px，取 4 倍 → 解码 1500px）。
+     * 某些格式不支持降采样时退回全尺寸解码，行为与改造前一致。
+     */
+    private DecodedImage decodeForThumbnail(byte[] imageBytes, int maxEdge) throws IOException {
+        try (javax.imageio.stream.ImageInputStream iis =
+                     ImageIO.createImageInputStream(new ByteArrayInputStream(imageBytes))) {
+            if (iis == null) {
+                return null;
+            }
+            java.util.Iterator<ImageReader> readers = ImageIO.getImageReaders(iis);
+            if (!readers.hasNext()) {
+                return null; // JDK 没有对应格式的解码器（如 WebP）
+            }
+            ImageReader reader = readers.next();
+            try {
+                reader.setInput(iis, false, true);
+                int width = reader.getWidth(0);
+                int height = reader.getHeight(0);
+                if (width <= 0 || height <= 0) {
+                    return null;
+                }
+                int srcLongEdge = Math.max(width, height);
+                int targetLongEdge = Math.max(1, Math.min(maxEdge, srcLongEdge));
+                int factor = 1;
+                while (srcLongEdge / (factor * 2) >= targetLongEdge) {
+                    factor *= 2;
+                }
+
+                BufferedImage image;
+                try {
+                    ImageReadParam param = reader.getDefaultReadParam();
+                    if (factor > 1) {
+                        param.setSourceSubsampling(factor, factor, 0, 0);
+                    }
+                    image = reader.read(0, param);
+                } catch (Exception unsupported) {
+                    log.debug("该格式不支持降采样，退回全尺寸解码: {}", unsupported.getMessage());
+                    image = ImageIO.read(new ByteArrayInputStream(imageBytes));
+                }
+                return image == null ? null : new DecodedImage(image, width, height);
+            } finally {
+                reader.dispose();
+            }
+        }
+    }
+
+    /** 统一编码为 JPEG（q=0.85） */
+    private byte[] toJpegBytes(BufferedImage image) throws IOException {
+        ImageWriter writer = ImageIO.getImageWritersByFormatName("jpeg").next();
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        try (javax.imageio.stream.ImageOutputStream ios = ImageIO.createImageOutputStream(out)) {
+            ImageWriteParam params = writer.getDefaultWriteParam();
+            params.setCompressionMode(ImageWriteParam.MODE_EXPLICIT);
+            params.setCompressionQuality(0.85f);
+            writer.setOutput(ios);
+            writer.write(null, new javax.imageio.IIOImage(image, null, null), params);
+        } finally {
+            writer.dispose();
+        }
+        return out.toByteArray();
     }
 
     /**

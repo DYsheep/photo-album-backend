@@ -22,6 +22,10 @@ import org.mockito.junit.jupiter.MockitoExtension;
 import org.springframework.mock.web.MockMultipartFile;
 import org.springframework.test.util.ReflectionTestUtils;
 
+import javax.imageio.ImageIO;
+import java.awt.image.BufferedImage;
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -330,6 +334,102 @@ class PhotoServiceTest {
             assertNotNull(result);
             assertEquals("风景", result.getCategoryName());
             verify(categoryMapper).selectBatchIds(any());
+        }
+    }
+
+    // ============================================================
+    // 缩略图生成（降采样解码 / 不放大 / 白底）
+    // ============================================================
+
+    @Nested
+    @DisplayName("generateThumbnailBytes() - 缩略图生成")
+    class ThumbnailTests {
+
+        private byte[] encodePng(BufferedImage image) throws IOException {
+            ByteArrayOutputStream out = new ByteArrayOutputStream();
+            ImageIO.write(image, "png", out);
+            return out.toByteArray();
+        }
+
+        /** 生成纯色位图；alpha=true 时构造全透明图（用于验证白底） */
+        private BufferedImage solid(int width, int height, boolean alpha) {
+            BufferedImage image = new BufferedImage(width, height,
+                    alpha ? BufferedImage.TYPE_INT_ARGB : BufferedImage.TYPE_INT_RGB);
+            if (!alpha) {
+                java.awt.Graphics2D g = image.createGraphics();
+                g.setColor(java.awt.Color.RED);
+                g.fillRect(0, 0, width, height);
+                g.dispose();
+            }
+            return image;
+        }
+
+        @Test
+        @DisplayName("大图按长边缩到 800，输出为 JPEG")
+        void largeImageIsScaledDownToLongEdge() throws Exception {
+            byte[] png = encodePng(solid(3000, 2000, false));
+
+            byte[] thumb = photoService.generateThumbnailBytes(png, 800);
+
+            assertNotNull(thumb);
+            // JPEG 魔数
+            assertEquals((byte) 0xFF, thumb[0]);
+            assertEquals((byte) 0xD8, thumb[1]);
+            BufferedImage decoded = ImageIO.read(new ByteArrayInputStream(thumb));
+            assertEquals(800, decoded.getWidth());
+            assertEquals(533, decoded.getHeight());
+        }
+
+        @Test
+        @DisplayName("小图不放大：尺寸保持不变，但仍重新编码为 JPEG（不再原样复制原图）")
+        void smallImageKeepsSizeButIsReencoded() throws Exception {
+            byte[] png = encodePng(solid(600, 400, false));
+
+            byte[] thumb = photoService.generateThumbnailBytes(png, 800);
+
+            assertNotNull(thumb);
+            assertEquals((byte) 0xFF, thumb[0]);
+            assertEquals((byte) 0xD8, thumb[1]);
+            BufferedImage decoded = ImageIO.read(new ByteArrayInputStream(thumb));
+            assertEquals(600, decoded.getWidth());
+            assertEquals(400, decoded.getHeight());
+            assertFalse(Arrays.equals(png, thumb), "不应再把原图字节当成缩略图返回");
+        }
+
+        @Test
+        @DisplayName("竖图按长边（高度）限制，不产生超长缩略图")
+        void portraitImageIsCappedByLongEdge() throws Exception {
+            byte[] png = encodePng(solid(400, 2000, false));
+
+            byte[] thumb = photoService.generateThumbnailBytes(png, 800);
+
+            BufferedImage decoded = ImageIO.read(new ByteArrayInputStream(thumb));
+            assertEquals(160, decoded.getWidth());
+            assertEquals(800, decoded.getHeight());
+        }
+
+        @Test
+        @DisplayName("透明 PNG 的缩略图使用白底，不是黑底")
+        void transparentPngGetsWhiteBackground() throws Exception {
+            byte[] png = encodePng(solid(600, 400, true)); // 全透明
+
+            byte[] thumb = photoService.generateThumbnailBytes(png, 800);
+
+            BufferedImage decoded = ImageIO.read(new ByteArrayInputStream(thumb));
+            int rgb = decoded.getRGB(10, 10);
+            int r = (rgb >> 16) & 0xFF;
+            int g = (rgb >> 8) & 0xFF;
+            int b = rgb & 0xFF;
+            assertTrue(r > 240 && g > 240 && b > 240,
+                    "透明区域应为白色，实际 RGB=" + r + "," + g + "," + b);
+        }
+
+        @Test
+        @DisplayName("无法解码的字节返回 null，由调用方回退原图")
+        void undecodableBytesReturnNull() {
+            byte[] garbage = new byte[]{(byte) 0xFF, (byte) 0xD8, (byte) 0xFF, 1, 2, 3};
+
+            assertNull(photoService.generateThumbnailBytes(garbage, 800));
         }
     }
 
