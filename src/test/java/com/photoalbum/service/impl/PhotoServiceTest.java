@@ -6,6 +6,7 @@ import com.photoalbum.common.BusinessException;
 import com.photoalbum.dto.PhotoDTO;
 import com.photoalbum.entity.Category;
 import com.photoalbum.entity.Photo;
+import com.photoalbum.mapper.AuthTupleMapper;
 import com.photoalbum.mapper.CategoryMapper;
 import com.photoalbum.mapper.PhotoCollectionPhotoMapper;
 import com.photoalbum.mapper.PhotoMapper;
@@ -53,6 +54,10 @@ class PhotoServiceTest {
     @Mock
     private ShareLinkMapper shareLinkMapper;
 
+    /** 删除照片时会按 photo 维度清理授权元组，避免孤儿授权 */
+    @Mock
+    private AuthTupleMapper authTupleMapper;
+
 
     /** 可见性策略由 AccessPolicyTest 单独覆盖，此处仅需注入以保证调用链完整 */
     @Mock
@@ -99,6 +104,9 @@ class PhotoServiceTest {
         ReflectionTestUtils.setField(urlResolver, "presignedTtlMinutes", 60L);
         ReflectionTestUtils.setField(urlResolver, "privateAclEnabled", false);
         ReflectionTestUtils.setField(photoService, "photoUrlResolver", urlResolver);
+        // 写路径统一要求"照片对调用者可见"（对象级判定）。单测默认放行可见性，
+        // 拒绝路径由 WriteVisibilityTests 用显式 stub 覆盖。
+        lenient().when(accessPolicy.canViewPhoto(any(), any())).thenReturn(true);
     }
 
     @AfterEach
@@ -392,12 +400,13 @@ class PhotoServiceTest {
 
             when(photoMapper.selectById(1L)).thenReturn(p1);
             when(photoMapper.selectById(2L)).thenReturn(p2);
-            when(photoMapper.selectById(3L)).thenReturn(null); // 第三张不存在
-            when(photoMapper.deleteBatchIds(ids)).thenReturn(2);
+            when(photoMapper.selectById(3L)).thenReturn(null); // 第三张不存在（不可见同样按跳过处理）
+            when(photoMapper.deleteBatchIds(Arrays.asList(1L, 2L))).thenReturn(2);
 
             photoService.batchDelete(ids);
 
-            verify(photoMapper).deleteBatchIds(ids);
+            // 只删真正可见的记录：不存在/不可见的 id 不会被带入删除语句
+            verify(photoMapper).deleteBatchIds(Arrays.asList(1L, 2L));
         }
 
         @Test
@@ -405,10 +414,8 @@ class PhotoServiceTest {
         void shouldHandleEmptyIdList() throws Exception {
             List<Long> ids = Collections.emptyList();
 
-            when(photoMapper.deleteBatchIds(ids)).thenReturn(0);
-
             assertDoesNotThrow(() -> photoService.batchDelete(ids));
-            verify(photoMapper).deleteBatchIds(ids);
+            verify(photoMapper, never()).deleteBatchIds(anyList());
         }
 
         @Test
@@ -806,6 +813,64 @@ class PhotoServiceTest {
             assertEquals(1, tags.split("日出", -1).length - 1);
             assertEquals(1, tags.split("旅行", -1).length - 1);
             verify(photoMapper).updateById(any(Photo.class));
+        }
+    }
+
+    // ============================================================
+    // 写操作的对象级权限（P1-2：不可见即不可写）
+    // ============================================================
+
+    @Nested
+    @DisplayName("写操作对象级权限 - 不可见照片不得改写/删除")
+    class WriteVisibilityTests {
+
+        @Test
+        @DisplayName("更新与删除不可见照片一律 404，且不产生任何写操作")
+        void shouldRejectWritesOnInvisiblePhoto() {
+            Photo hidden = new Photo();
+            hidden.setId(9L);
+            hidden.setIsPrivate(1);
+            hidden.setUrl("2026/05/hidden.jpg");
+            when(photoMapper.selectById(9L)).thenReturn(hidden);
+            when(accessPolicy.canViewPhoto(any(), eq(hidden))).thenReturn(false);
+
+            PhotoDTO patch = new PhotoDTO();
+            patch.setTitle("被篡改");
+
+            assertEquals(404, assertThrows(BusinessException.class,
+                    () -> photoService.updatePhoto(9L, patch)).getCode());
+            assertEquals(404, assertThrows(BusinessException.class,
+                    () -> photoService.deletePhoto(9L)).getCode());
+
+            verify(photoMapper, never()).updateById(any(Photo.class));
+            verify(photoMapper, never()).deleteById(anyLong());
+            // 私密标记也不应被改动
+            assertEquals(1, hidden.getIsPrivate());
+        }
+
+        @Test
+        @DisplayName("批量编辑只作用于可见照片，不可见照片保持原样")
+        void shouldOnlyTouchVisiblePhotosInBatchUpdate() {
+            Photo visible = new Photo();
+            visible.setId(1L);
+            visible.setTags("风景");
+            Photo hidden = new Photo();
+            hidden.setId(2L);
+            hidden.setIsPrivate(1);
+            hidden.setTags("私密");
+
+            when(photoMapper.selectBatchIds(Arrays.asList(1L, 2L)))
+                    .thenReturn(Arrays.asList(visible, hidden));
+            when(accessPolicy.canViewPhoto(any(), eq(visible))).thenReturn(true);
+            when(accessPolicy.canViewPhoto(any(), eq(hidden))).thenReturn(false);
+            when(photoMapper.updateById(any(Photo.class))).thenReturn(1);
+
+            photoService.batchUpdate(Arrays.asList(1L, 2L), 3L, "新标签");
+
+            verify(photoMapper, times(1)).updateById(any(Photo.class));
+            assertEquals(3L, visible.getCategoryId());
+            assertNull(hidden.getCategoryId());
+            assertFalse(hidden.getTags().contains("新标签"));
         }
     }
 

@@ -98,19 +98,23 @@ public class ShareServiceImpl implements ShareService {
 
     @Override
     public ShareLinkDTO createShareLink(Long photoId, LocalDateTime expiresAt) {
-        // 校验照片是否存在
+        // 校验照片存在且当前调用者可见：不可见（含无权访问的私密照片）一律按不存在处理。
+        // 这条判定必须放在服务层——控制器有两个入口（公开 / 后台），只在其中一个加守卫
+        // 会让另一个入口成为私密照片的绕过点（响应里带的是预签名直链）。
         Photo photo = photoMapper.selectById(photoId);
-        if (photo == null) {
+        if (photo == null || !accessPolicy.canViewPhoto(CurrentUserSupport.getCurrentUser(), photo)) {
             throw new BusinessException(404, "照片不存在");
         }
 
         LocalDateTime normalizedExpiry = normalizeExpiry(expiresAt);
+        User operator = CurrentUserSupport.getCurrentUser();
 
         // 同一张照片只保留一条链接：已存在则按本次设置更新有效期（永久传 null）
         ShareLink existing = shareLinkMapper.selectOne(
                 new LambdaQueryWrapper<ShareLink>().eq(ShareLink::getPhotoId, photoId));
         if (existing != null) {
             existing.setExpiresAt(normalizedExpiry);
+            existing.setCreatedBy(operator != null ? operator.getId() : null);
             shareLinkMapper.updateById(existing);
             log.info("分享链接有效期已更新: photoId={}, code={}, expiresAt={}",
                     photoId, existing.getCode(), normalizedExpiry);
@@ -125,6 +129,7 @@ public class ShareServiceImpl implements ShareService {
         shareLink.setPhotoId(photoId);
         shareLink.setExpiresAt(normalizedExpiry);
         shareLink.setCreatedAt(LocalDateTime.now());
+        shareLink.setCreatedBy(operator != null ? operator.getId() : null);
 
         shareLinkMapper.insert(shareLink);
         log.info("分享链接创建成功: photoId={}, code={}, expiresAt={}", photoId, code, normalizedExpiry);
@@ -220,6 +225,8 @@ public class ShareServiceImpl implements ShareService {
         String encodedCode = (trimmedCode == null || trimmedCode.isEmpty())
                 ? null : passwordEncoder.encode(trimmedCode);
 
+        User creator = CurrentUserSupport.getCurrentUser();
+
         // 同一合集只保留一条链接：已存在则更新有效期/私密开关/口令
         ShareLink existing = shareLinkMapper.selectOne(new LambdaQueryWrapper<ShareLink>()
                 .eq(ShareLink::getTargetType, "collection")
@@ -228,6 +235,10 @@ public class ShareServiceImpl implements ShareService {
             existing.setExpiresAt(normalizedExpiry);
             existing.setIncludePrivate(withPrivate ? 1 : 0);
             existing.setAccessCode(encodedCode);
+            // created_by 决定"用谁的可见范围生成照片清单"。接管既有分享时必须同步为
+            // 实际操作人，否则低权限协作者改写他人分享的口令后，仍以原创建者视角
+            // 读到创建者能看、而它自己看不到的私密照片（越权读取）。
+            existing.setCreatedBy(creator != null ? creator.getId() : null);
             shareLinkMapper.updateById(existing);
             log.info("合集分享已更新: collectionId={}, code={}, includePrivate={}, expiresAt={}",
                     collectionId, existing.getCode(), withPrivate, normalizedExpiry);
@@ -243,7 +254,6 @@ public class ShareServiceImpl implements ShareService {
         shareLink.setAccessCode(encodedCode);
         shareLink.setExpiresAt(normalizedExpiry);
         shareLink.setCreatedAt(LocalDateTime.now());
-        User creator = CurrentUserSupport.getCurrentUser();
         shareLink.setCreatedBy(creator != null ? creator.getId() : null);
         shareLinkMapper.insert(shareLink);
         log.info("合集分享创建成功: collectionId={}, code={}, includePrivate={}, expiresAt={}",
@@ -346,8 +356,12 @@ public class ShareServiceImpl implements ShareService {
             } else {
                 Photo photo = photoMapper.selectById(sl.getPhotoId());
                 if (photo != null) {
-                    dto.setPhotoTitle(photo.getTitle());
-                    dto.setPhotoUrl(photoUrlResolver.resolve(photo.getUrl(), photo.getIsPrivate()));
+                    // 与详情接口同一可见性口径：当前调用者看不到的照片，连标题与地址
+                    // 都不返回。否则管理列表会成为私密照片的批量出口（地址是预签名直链）。
+                    if (accessPolicy.canViewPhoto(CurrentUserSupport.getCurrentUser(), photo)) {
+                        dto.setPhotoTitle(photo.getTitle());
+                        dto.setPhotoUrl(photoUrlResolver.resolve(photo.getUrl(), photo.getIsPrivate()));
+                    }
                 }
             }
             return dto;

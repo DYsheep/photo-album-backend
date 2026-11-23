@@ -3,9 +3,12 @@ package com.photoalbum.service;
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.baomidou.mybatisplus.core.conditions.query.QueryWrapper;
 import com.photoalbum.common.BusinessException;
+import com.photoalbum.common.PermissionConstants;
+import com.photoalbum.entity.AuthTuple;
 import com.photoalbum.entity.Photo;
 import com.photoalbum.entity.PhotoTag;
 import com.photoalbum.entity.Tag;
+import com.photoalbum.mapper.AuthTupleMapper;
 import com.photoalbum.mapper.PhotoMapper;
 import com.photoalbum.mapper.PhotoTagMapper;
 import com.photoalbum.mapper.TagMapper;
@@ -43,6 +46,7 @@ public class TagService {
     private final TagMapper tagMapper;
     private final PhotoTagMapper photoTagMapper;
     private final PhotoMapper photoMapper;
+    private final AuthTupleMapper authTupleMapper;
 
     // ========== 写路径：同步 ==========
 
@@ -106,6 +110,20 @@ public class TagService {
                 .collect(Collectors.toCollection(LinkedHashSet::new));
     }
 
+    /**
+     * 删除某张照片的全部标签关联
+     *
+     * 照片删除时调用：残留的关联行会让标签级授权的级联子查询命中已不存在的照片，
+     * 也会污染标签引用计数。
+     */
+    @Transactional
+    public void deleteRelationsOfPhoto(Long photoId) {
+        if (photoId == null) {
+            return;
+        }
+        photoTagMapper.delete(new LambdaQueryWrapper<PhotoTag>().eq(PhotoTag::getPhotoId, photoId));
+    }
+
     // ========== 读路径：管理端列表 ==========
 
     /** 各标签的引用数（关联表聚合，不再全表扫描字符串） */
@@ -157,9 +175,11 @@ public class TagService {
         List<Long> photoIds = photoIdsOfTag(tag.getId());
         photoTagMapper.delete(new LambdaQueryWrapper<PhotoTag>().eq(PhotoTag::getTagId, tag.getId()));
         tagMapper.deleteById(tag.getId());
+        // 授权元组一并清理：残留的 tag 授权没有外键约束，一旦 id 被复用
+        // 会作用到同名/新标签上（"幽灵授权"），也让后台无法判断还剩哪些生效授权
+        deleteGrantsOfTag(tag.getId());
         refreshColumns(photoIds);
-        // 指向该标签的标签级授权随之失效（授权记录保留，可在后台清理）
-        log.info("标签已删除: {}（影响 {} 张照片）", name, photoIds.size());
+        log.info("标签已删除: {}（影响 {} 张照片，同时清除其标签级授权）", name, photoIds.size());
     }
 
     @Transactional
@@ -202,6 +222,8 @@ public class TagService {
                 }
             }
             photoTagMapper.delete(new LambdaQueryWrapper<PhotoTag>().eq(PhotoTag::getTagId, source.getId()));
+            // 合并掉的源标签同样要清掉指向它的授权
+            deleteGrantsOfTag(source.getId());
             tagMapper.deleteById(source.getId());
         }
         refreshColumns(new ArrayList<>(affectedPhotoIds));
@@ -227,6 +249,16 @@ public class TagService {
     }
 
     // ========== 内部工具 ==========
+
+    /** 删除指向某标签的全部授权元组（标签删除/合并时调用） */
+    private void deleteGrantsOfTag(Long tagId) {
+        if (tagId == null) {
+            return;
+        }
+        authTupleMapper.delete(new LambdaQueryWrapper<AuthTuple>()
+                .eq(AuthTuple::getObjectType, PermissionConstants.TARGET_TAG)
+                .eq(AuthTuple::getObjectId, tagId));
+    }
 
     private Tag requireTag(String name) {
         Tag tag = tagMapper.selectOne(new LambdaQueryWrapper<Tag>().eq(Tag::getName, name));

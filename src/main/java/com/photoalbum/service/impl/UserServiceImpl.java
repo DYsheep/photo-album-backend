@@ -1,18 +1,21 @@
 package com.photoalbum.service.impl;
 
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
+import com.baomidou.mybatisplus.core.conditions.update.LambdaUpdateWrapper;
 import com.photoalbum.common.BusinessException;
 import com.photoalbum.common.PermissionConstants;
 import com.photoalbum.common.UserRoles;
 import com.photoalbum.dto.UserUpsertDTO;
 import com.photoalbum.entity.CollectionMember;
 import com.photoalbum.entity.Photo;
+import com.photoalbum.entity.ShareLink;
 import com.photoalbum.entity.User;
 import com.photoalbum.entity.AuthTuple;
 import com.photoalbum.mapper.CategoryMapper;
 import com.photoalbum.mapper.CollectionMemberMapper;
 import com.photoalbum.mapper.PhotoCollectionMapper;
 import com.photoalbum.mapper.PhotoMapper;
+import com.photoalbum.mapper.ShareLinkMapper;
 import com.photoalbum.mapper.UserMapper;
 import com.photoalbum.mapper.AuthTupleMapper;
 import com.photoalbum.security.AccessPolicy;
@@ -36,6 +39,7 @@ public class UserServiceImpl implements UserService {
     private final PhotoCollectionMapper collectionMapper;
     private final CategoryMapper categoryMapper;
     private final CollectionMemberMapper memberMapper;
+    private final ShareLinkMapper shareLinkMapper;
     private final AuditService auditService;
     private final AccessPolicy accessPolicy;
     private final PasswordEncoder passwordEncoder;
@@ -43,6 +47,7 @@ public class UserServiceImpl implements UserService {
     public UserServiceImpl(UserMapper userMapper, AuthTupleMapper tupleMapper,
                            PhotoMapper photoMapper, PhotoCollectionMapper collectionMapper,
                            CategoryMapper categoryMapper, CollectionMemberMapper memberMapper,
+                           ShareLinkMapper shareLinkMapper,
                            AuditService auditService, AccessPolicy accessPolicy,
                            @Lazy PasswordEncoder passwordEncoder) {
         this.userMapper = userMapper;
@@ -51,6 +56,7 @@ public class UserServiceImpl implements UserService {
         this.collectionMapper = collectionMapper;
         this.categoryMapper = categoryMapper;
         this.memberMapper = memberMapper;
+        this.shareLinkMapper = shareLinkMapper;
         this.auditService = auditService;
         this.accessPolicy = accessPolicy;
         this.passwordEncoder = passwordEncoder;
@@ -168,9 +174,18 @@ public class UserServiceImpl implements UserService {
         tupleMapper.delete(new LambdaQueryWrapper<AuthTuple>()
                 .eq(AuthTuple::getSubjectType, "user")
                 .eq(AuthTuple::getSubjectId, id));
+        // 协作者关系必须一并清理：残留行会让被删用户 id 在复用后自动获得
+        // 那些合集的写权限（成员判定只看 user_id 是否存在记录）
+        memberMapper.delete(new LambdaQueryWrapper<CollectionMember>()
+                .eq(CollectionMember::getUserId, id));
+        // 分享的创建人置空：合集分享按"创建人可见范围"取照片，创建人不存在时
+        // 该分享会 fail-closed（不展示照片），避免 id 复用时以新用户视角计算
+        shareLinkMapper.update(null, new LambdaUpdateWrapper<ShareLink>()
+                .set(ShareLink::getCreatedBy, null)
+                .eq(ShareLink::getCreatedBy, id));
         userMapper.deleteById(id);
         auditService.record(AuditService.ACTION_USER_DELETE, AuditService.TARGET_USER, id,
-                String.format("删除账号 %s（角色 %s），同时清除其全部授权条目",
+                String.format("删除账号 %s（角色 %s），同时清除其全部授权条目、合集协作者关系与分享归属",
                         user.getUsername(), UserRoles.normalize(user.getRole())));
     }
 

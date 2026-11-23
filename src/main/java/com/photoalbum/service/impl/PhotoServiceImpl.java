@@ -5,15 +5,20 @@ import com.baomidou.mybatisplus.core.conditions.update.LambdaUpdateWrapper;
 import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
 import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
 import com.photoalbum.common.BusinessException;
+import com.photoalbum.common.PermissionConstants;
 import com.photoalbum.common.UserRoles;
 import com.photoalbum.config.MybatisPlusConfig;
 import com.photoalbum.dto.PhotoDTO;
+import com.photoalbum.entity.AuthTuple;
 import com.photoalbum.entity.Category;
 import com.photoalbum.entity.Photo;
+import com.photoalbum.entity.PhotoCollection;
 import com.photoalbum.entity.PhotoCollectionPhoto;
 import com.photoalbum.entity.ShareLink;
 import com.photoalbum.entity.User;
+import com.photoalbum.mapper.AuthTupleMapper;
 import com.photoalbum.mapper.CategoryMapper;
+import com.photoalbum.mapper.PhotoCollectionMapper;
 import com.photoalbum.mapper.PhotoCollectionPhotoMapper;
 import com.photoalbum.mapper.PhotoMapper;
 import com.photoalbum.mapper.ShareLinkMapper;
@@ -67,8 +72,10 @@ public class PhotoServiceImpl extends ServiceImpl<PhotoMapper, Photo> implements
 
     private final PhotoMapper photoMapper;
     private final CategoryMapper categoryMapper;
+    private final PhotoCollectionMapper collectionMapper;
     private final PhotoCollectionPhotoMapper collectionPhotoMapper;
     private final ShareLinkMapper shareLinkMapper;
+    private final AuthTupleMapper authTupleMapper;
     private final AccessPolicy accessPolicy;
     private final PhotoUrlResolver photoUrlResolver;
     private final TagService tagService;
@@ -200,6 +207,16 @@ public class PhotoServiceImpl extends ServiceImpl<PhotoMapper, Photo> implements
         if (isPrivate != null && isPrivate == 1 && !isAdmin()) {
             throw new BusinessException(403, "仅管理员可上传私密照片");
         }
+        // 目标合集必须存在且当前调用者可管理：
+        // 否则只持 photo:upload 的账号可把照片注入任意他人的合集（含私密合集），
+        // 绕过 POST /api/admin/collections/{id}/photos/{photoId} 上的对象级校验。
+        PhotoCollection targetCollection = null;
+        if (collectionId != null) {
+            targetCollection = collectionMapper.selectById(collectionId);
+            if (targetCollection == null || !accessPolicy.canManageCollection(getCurrentUser(), targetCollection)) {
+                throw new BusinessException(404, "合集不存在");
+            }
+        }
         validateFile(file);
 
         String dateDir = LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyy/MM"));
@@ -246,7 +263,11 @@ public class PhotoServiceImpl extends ServiceImpl<PhotoMapper, Photo> implements
         photo.setFileName(originalName);
         photo.setFileSize(file.getSize());
         photo.setTags(tags != null ? tags : "");
-        photo.setIsPrivate(isPrivate != null ? isPrivate : 0);
+        // 私密合集内的新照片与合集保持一致（与 CollectionService.addPhoto 的级联规则对齐），
+        // 否则上传路径会成为向私密合集塞入公开照片的旁路
+        boolean inheritPrivate = targetCollection != null
+                && targetCollection.getIsPrivate() != null && targetCollection.getIsPrivate() == 1;
+        photo.setIsPrivate(inheritPrivate ? 1 : (isPrivate != null ? isPrivate : 0));
         photo.setViewCount(0);
         photo.setLikeCount(0);
         photo.setExifInfo(exifData.get("exifJson"));
@@ -330,10 +351,7 @@ public class PhotoServiceImpl extends ServiceImpl<PhotoMapper, Photo> implements
      */
     @Override
     public void updatePhoto(Long id, PhotoDTO dto) {
-        Photo photo = photoMapper.selectById(id);
-        if (photo == null) {
-            throw new BusinessException(404, "照片不存在");
-        }
+        Photo photo = requireManageablePhoto(id);
 
         if (dto.getTitle() != null) photo.setTitle(dto.getTitle());
         if (dto.getDescription() != null) photo.setDescription(dto.getDescription());
@@ -389,34 +407,50 @@ public class PhotoServiceImpl extends ServiceImpl<PhotoMapper, Photo> implements
     }
 
     /**
-     * 删除单张照片（同步删除磁盘文件）
+     * 删除单张照片（同步删除对象存储文件与全部派生数据）
+     *
+     * 需对象级权限：不可见（含无权访问的私密照片）按"不存在"处理，
+     * 避免用删除接口的 404/200 差异探测全站照片是否存在。
      */
     @Override
     @Transactional(rollbackFor = Exception.class)
     public void deletePhoto(Long id) throws Exception {
-        Photo photo = photoMapper.selectById(id);
-        if (photo == null) {
-            throw new BusinessException(404, "照片不存在");
-        }
+        Photo photo = requireManageablePhoto(id);
 
-        // 删除 COS 文件（原图 + 缩略图）
-        deleteFile(photo.getUrl());
-        deleteFile(photo.getThumbnailUrl());
-
-        // 删除合集关联
-        LambdaQueryWrapper<PhotoCollectionPhoto> colWp = new LambdaQueryWrapper<>();
-        colWp.eq(PhotoCollectionPhoto::getPhotoId, id);
-        collectionPhotoMapper.delete(colWp);
-
-        // 删除分享链接
-        LambdaQueryWrapper<ShareLink> shareWp = new LambdaQueryWrapper<>();
-        shareWp.eq(ShareLink::getPhotoId, id);
-        shareLinkMapper.delete(shareWp);
+        // 清理派生资源（对象存储、合集关联、分享、标签关联、授权元组）
+        purgePhotoDerivatives(photo);
 
         // 删除数据库记录
         photoMapper.deleteById(id);
 
         log.info("照片已删除: id={}", id);
+    }
+
+    /**
+     * 清理一张照片的全部派生数据（不含照片主记录本身）
+     *
+     * 授权元组必须一起清理：t_auth_tuple 按 object_id 指向照片且没有外键，
+     * 照片删除后残留就成了"幽灵授权"——一旦 id 被复用（灌库、备份恢复、
+     * 手工改自增），新照片会继承旧照片的授权，原授权对象自动获得可见性。
+     */
+    private void purgePhotoDerivatives(Photo photo) {
+        Long id = photo.getId();
+        // 文件删除失败不应阻断数据清理（对象存储是外部依赖）
+        try {
+            deleteFile(photo.getUrl());
+            deleteFile(photo.getThumbnailUrl());
+        } catch (Exception e) {
+            log.warn("删除照片文件失败: id={}", id, e);
+        }
+
+        collectionPhotoMapper.delete(new LambdaQueryWrapper<PhotoCollectionPhoto>()
+                .eq(PhotoCollectionPhoto::getPhotoId, id));
+        shareLinkMapper.delete(new LambdaQueryWrapper<ShareLink>()
+                .eq(ShareLink::getPhotoId, id));
+        authTupleMapper.delete(new LambdaQueryWrapper<AuthTuple>()
+                .eq(AuthTuple::getObjectType, PermissionConstants.TARGET_PHOTO)
+                .eq(AuthTuple::getObjectId, id));
+        tagService.deleteRelationsOfPhoto(id);
     }
 
     /**
@@ -560,7 +594,14 @@ public class PhotoServiceImpl extends ServiceImpl<PhotoMapper, Photo> implements
             throw new BusinessException("单次最多编辑 50 张");
         }
 
-        List<Photo> photos = photoMapper.selectBatchIds(ids);
+        // 只处理当前调用者可见的照片：不可见的直接排除（与"不存在"同口径），
+        // 否则批量编辑会变成对他人私密照片的盲改通道
+        List<Photo> photos = photoMapper.selectBatchIds(ids).stream()
+                .filter(photo -> accessPolicy.canViewPhoto(getCurrentUser(), photo))
+                .collect(Collectors.toList());
+        if (photos.isEmpty()) {
+            throw new BusinessException(404, "照片不存在");
+        }
         for (Photo photo : photos) {
             boolean modified = false;
 
@@ -655,6 +696,28 @@ public class PhotoServiceImpl extends ServiceImpl<PhotoMapper, Photo> implements
     }
 
     /**
+     * 取"当前调用者可见范围内的照片"，不存在与不可见一律返回 null
+     *
+     * 写操作必须经过这里：只判"记录是否存在"会让写接口变成存在性预言机——
+     * 详情接口对无权访问的私密照片刻意返回 404，而写接口若返回 200 就等于确认了该 ID 存在。
+     * 批量场景下两者也必须归为同一结果（都跳过），否则"存在但无权"与"不存在"的差异
+     * 同样会泄漏存在性。
+     */
+    private Photo loadManageablePhotoOrNull(Long id) {
+        Photo photo = id == null ? null : photoMapper.selectById(id);
+        return (photo != null && accessPolicy.canViewPhoto(getCurrentUser(), photo)) ? photo : null;
+    }
+
+    /** 取当前调用者可管理的照片；不可见与不存在统一按 404 处理 */
+    private Photo requireManageablePhoto(Long id) {
+        Photo photo = loadManageablePhotoOrNull(id);
+        if (photo == null) {
+            throw new BusinessException(404, "照片不存在");
+        }
+        return photo;
+    }
+
+    /**
      * 格式化文件大小
      */
     private String formatFileSize(long bytes) {
@@ -666,21 +729,29 @@ public class PhotoServiceImpl extends ServiceImpl<PhotoMapper, Photo> implements
 
     /**
      * 批量删除
+     *
+     * 逐张做可见性判定：不存在与不可见都跳过（两者口径一致，不构成存在性预言机），
+     * 只删真正可见的记录，因此不会出现"删掉了自己看不到的照片"。
      */
     @Override
     @Transactional(rollbackFor = Exception.class)
     public void batchDelete(List<Long> ids) throws Exception {
-        for (Long id : ids) {
-            Photo photo = photoMapper.selectById(id);
-            if (photo == null) continue;
-            try {
-                deleteFile(photo.getUrl());
-            } catch (Exception e) {
-                log.warn("删除文件失败: {}", photo.getUrl(), e);
-            }
+        if (ids == null || ids.isEmpty()) {
+            return;
         }
-        photoMapper.deleteBatchIds(ids);
-        log.info("批量删除完成: ids={}", ids);
+        List<Long> deletable = new ArrayList<>();
+        for (Long id : ids) {
+            Photo photo = loadManageablePhotoOrNull(id);
+            if (photo == null) {
+                continue;
+            }
+            purgePhotoDerivatives(photo);
+            deletable.add(photo.getId());
+        }
+        if (!deletable.isEmpty()) {
+            photoMapper.deleteBatchIds(deletable);
+        }
+        log.info("批量删除完成: 请求 {} 张，实际删除 {} 张", ids.size(), deletable.size());
     }
 
     // ========== 私有工具方法 ==========

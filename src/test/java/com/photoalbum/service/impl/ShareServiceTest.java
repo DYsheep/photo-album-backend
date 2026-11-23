@@ -75,6 +75,9 @@ class ShareServiceTest {
         ReflectionTestUtils.setField(urlResolver, "presignedTtlMinutes", 60L);
         ReflectionTestUtils.setField(urlResolver, "privateAclEnabled", false);
         ReflectionTestUtils.setField(shareService, "photoUrlResolver", urlResolver);
+        // 创建分享要求"照片对调用者可见"（服务层统一校验）。单测默认放行，
+        // 拒绝路径由"不可见照片应拒绝创建分享"用例显式覆盖。
+        lenient().when(accessPolicy.canViewPhoto(any(), any())).thenReturn(true);
     }
 
     // ============================================================
@@ -175,6 +178,27 @@ class ShareServiceTest {
 
             // 验证没有尝试创建分享链接
             verify(shareLinkMapper, never()).selectOne(any());
+            verify(shareLinkMapper, never()).insert(any());
+        }
+
+        @Test
+        @DisplayName("照片对调用者不可见时，拒绝创建分享（404，不暴露存在性）")
+        void shouldRejectShareCreationForInvisiblePhoto() {
+            // Arrange：照片存在但当前调用者无权查看（例如无 photo:view_private 的账号访问私密照片）
+            Long photoId = 7L;
+            Photo invisible = buildPhoto(photoId, "私密照片", "2026/05/private.jpg");
+            invisible.setIsPrivate(1);
+            when(photoMapper.selectById(photoId)).thenReturn(invisible);
+            when(accessPolicy.canViewPhoto(any(), eq(invisible))).thenReturn(false);
+
+            // Act & Assert
+            BusinessException ex = assertThrows(BusinessException.class, () ->
+                    shareService.createShareLink(photoId, null)
+            );
+
+            assertEquals(404, ex.getCode());
+            assertThat(ex.getMessage()).contains("照片不存在");
+            // 关键：不得签发任何可访问地址（否则私密照片会经预签名直链外泄）
             verify(shareLinkMapper, never()).insert(any());
         }
 

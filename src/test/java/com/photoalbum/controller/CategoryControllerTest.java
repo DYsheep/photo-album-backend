@@ -54,6 +54,10 @@ class CategoryControllerTest {
     @MockBean
     private PhotoMapper photoMapper;
 
+    /** 删除分类时需清理该分类维度的授权元组（避免孤儿授权） */
+    @MockBean
+    private com.photoalbum.mapper.AuthTupleMapper authTupleMapper;
+
     @BeforeEach
     void loginAsAdmin() {
         User user = new User();

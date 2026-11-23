@@ -2,10 +2,13 @@ package com.photoalbum.controller;
 
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.photoalbum.common.BusinessException;
+import com.photoalbum.common.PermissionConstants;
 import com.photoalbum.common.Result;
 import com.photoalbum.dto.CategoryDTO;
+import com.photoalbum.entity.AuthTuple;
 import com.photoalbum.entity.Category;
 import com.photoalbum.entity.Photo;
+import com.photoalbum.mapper.AuthTupleMapper;
 import com.photoalbum.mapper.PhotoMapper;
 import com.photoalbum.service.CategoryService;
 import jakarta.validation.Valid;
@@ -29,6 +32,7 @@ public class CategoryController {
 
     private final CategoryService categoryService;
     private final PhotoMapper photoMapper;
+    private final AuthTupleMapper authTupleMapper;
 
     /**
      * 获取全部分类列表
@@ -120,6 +124,11 @@ public class CategoryController {
         }
 
         categoryService.removeById(id);
+        // 分类级授权随分类一并清理：t_auth_tuple 没有外键，残留会成为
+        // "幽灵授权"（后台仍显示、id 复用后作用到新分类上）
+        authTupleMapper.delete(new LambdaQueryWrapper<AuthTuple>()
+                .eq(AuthTuple::getObjectType, PermissionConstants.TARGET_CATEGORY)
+                .eq(AuthTuple::getObjectId, id));
         return Result.ok();
     }
 }

@@ -424,7 +424,11 @@ public class AccessPolicy {
      * 管理侧合集可见条件：数据范围 − 禁止项
      *
      * ALL            → 全站合集，扣除被 deny 的合集
-     * OWN_AND_GRANTED→ 自己创建的 + 协作者 + 被显式允许的合集，扣除被 deny 的合集
+     * OWN_AND_GRANTED→ 自己创建的 + 作为协作者参与的合集，扣除被 deny 的合集
+     *
+     * 注意：这里刻意**不**把 allowedCollectionIds（可见白名单）算进来。
+     * 白名单的语义是"能看"，管理列表必须与写入口的判定保持一致（见 canManageCollection），
+     * 否则会出现"列表里能看到、点进去却 404"的错配。
      */
     public void applyManagedCollectionFilter(LambdaQueryWrapper<PhotoCollection> wrapper, User user) {
         if (user == null) {
@@ -432,19 +436,16 @@ public class AccessPolicy {
             return;
         }
         Set<Long> denied = collectionScope(user).excludedCollectionIds();
-        Set<Long> allowed = collectionScope(user).allowedCollectionIds();
 
         if (!SCOPE_ALL.equals(dataScopeOf(user))) {
             Set<Long> memberIds = new LinkedHashSet<>();
             collectionMemberMapper.selectList(new LambdaQueryWrapper<com.photoalbum.entity.CollectionMember>()
                             .eq(com.photoalbum.entity.CollectionMember::getUserId, user.getId()))
                     .forEach(m -> memberIds.add(m.getCollectionId()));
-            Set<Long> ownOrGranted = new LinkedHashSet<>(allowed);
-            ownOrGranted.addAll(memberIds);
             wrapper.and(w -> {
                 w.eq(PhotoCollection::getCreatedBy, user.getId());
-                if (!ownOrGranted.isEmpty()) {
-                    w.or().in(PhotoCollection::getId, ownOrGranted);
+                if (!memberIds.isEmpty()) {
+                    w.or().in(PhotoCollection::getId, memberIds);
                 }
             });
         }
@@ -467,9 +468,9 @@ public class AccessPolicy {
         if (collection.getCreatedBy() != null && collection.getCreatedBy().equals(user.getId())) {
             return true;
         }
-        if (collectionScope(user).allowedCollectionIds().contains(collection.getId())) {
-            return true;
-        }
+        // 注意：这里刻意不认 allowedCollectionIds（t_auth_tuple 的白名单）。
+        // 白名单的语义是"能看"，不是"能管"——把可见授权当管理权会形成
+        // "授予只读 → 对方可改名/删合集/对外建分享"的提权链条。
         return collectionMemberMapper.selectCount(new LambdaQueryWrapper<com.photoalbum.entity.CollectionMember>()
                 .eq(com.photoalbum.entity.CollectionMember::getCollectionId, collection.getId())
                 .eq(com.photoalbum.entity.CollectionMember::getUserId, user.getId())) > 0;

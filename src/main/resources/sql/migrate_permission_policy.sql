@@ -4,6 +4,13 @@
 -- 后续结构变更请新增 src/main/resources/db/migration/Vn__*.sql，由 Flyway 自动执行。
 -- 适用：已在运行的 photo_album 库（一次性执行）
 -- 说明：本脚本可先于代码发布执行，与旧版本代码兼容。
+--
+-- 【风险提示 · 执行前必读】
+--   第 2 节会给"角色为 viewer 且没有任何白名单"的账号批量写入 (W, global) 授权，
+--   等价于让这些账号立刻可见全站全部私密照片。这既是兼容旧行为的必要动作，
+--   也是本项目权限面上影响最大的数据变更之一。
+--   执行后请务必运行 sql/audit_global_whitelist.sql 导出持权账号清单并逐个确认；
+--   如需收窄，请改为按 collection / category / tag / photo 逐项授权后再删除 global 条目。
 -- ============================================
 
 USE photo_album;

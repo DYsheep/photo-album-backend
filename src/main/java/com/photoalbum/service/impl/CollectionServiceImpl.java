@@ -2,18 +2,23 @@ package com.photoalbum.service.impl;
 
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.photoalbum.common.BusinessException;
+import com.photoalbum.common.PermissionConstants;
 import com.photoalbum.dto.CollectionDTO;
 import com.photoalbum.dto.PhotoDTO;
+import com.photoalbum.entity.AuthTuple;
 import com.photoalbum.entity.Category;
 import com.photoalbum.entity.Photo;
 import com.photoalbum.entity.PhotoCollection;
 import com.photoalbum.entity.PhotoCollectionPhoto;
+import com.photoalbum.entity.ShareLink;
 import com.photoalbum.entity.User;
+import com.photoalbum.mapper.AuthTupleMapper;
 import com.photoalbum.mapper.CategoryMapper;
 import com.photoalbum.mapper.CollectionMemberMapper;
 import com.photoalbum.mapper.PhotoCollectionMapper;
 import com.photoalbum.mapper.PhotoCollectionPhotoMapper;
 import com.photoalbum.mapper.PhotoMapper;
+import com.photoalbum.mapper.ShareLinkMapper;
 import com.photoalbum.mapper.UserMapper;
 import com.photoalbum.entity.CollectionMember;
 import com.photoalbum.security.AccessPolicy;
@@ -49,6 +54,8 @@ public class CollectionServiceImpl implements CollectionService {
     private final PhotoUrlResolver photoUrlResolver;
     private final CollectionMemberMapper memberMapper;
     private final UserMapper userMapper;
+    private final AuthTupleMapper authTupleMapper;
+    private final ShareLinkMapper shareLinkMapper;
 
     @Value("${file.access-url-prefix}")
     private String accessUrlPrefix;
@@ -64,6 +71,21 @@ public class CollectionServiceImpl implements CollectionService {
     private PhotoCollection requireAccessibleCollection(Long collectionId) {
         PhotoCollection collection = collectionMapper.selectById(collectionId);
         if (!accessPolicy.canAccessCollection(getCurrentUser(), collection)) {
+            throw new BusinessException(404, "合集不存在");
+        }
+        return collection;
+    }
+
+    /**
+     * 取"当前调用者可管理的合集"，不可管理（含不可见）一律按不存在处理
+     *
+     * 写操作必须用这个，而不是 requireAccessibleCollection：后者对任何**已发布的公开合集**
+     * 都返回 true（"能看到"不等于"能管理"）。用它做写入口的守卫，等于允许任何具备
+     * 内容管理能力的账号对全站公开合集改名、改封面、下线、删除。
+     */
+    private PhotoCollection requireManageableCollection(Long collectionId) {
+        PhotoCollection collection = collectionMapper.selectById(collectionId);
+        if (collection == null || !accessPolicy.canManageCollection(getCurrentUser(), collection)) {
             throw new BusinessException(404, "合集不存在");
         }
         return collection;
@@ -139,6 +161,8 @@ public class CollectionServiceImpl implements CollectionService {
 
     @Override
     public List<Map<String, Object>> listMembers(Long collectionId) {
+        // 与写入口同一判定：协作者本人可看（isMember 成立），其他人需要可管理权
+        requireManageableCollection(collectionId);
         List<CollectionMember> members = memberMapper.selectList(
                 new LambdaQueryWrapper<CollectionMember>()
                         .eq(CollectionMember::getCollectionId, collectionId)
@@ -160,9 +184,10 @@ public class CollectionServiceImpl implements CollectionService {
     @Override
     @Transactional
     public void addMember(Long collectionId, Long userId) {
-        if (collectionMapper.selectById(collectionId) == null) {
-            throw new BusinessException(404, "合集不存在");
-        }
+        // 对象级判定：只能给"自己可管理"的合集指派协作者。
+        // 此前只判存在性，任何具备内容管理能力的账号都能把第三方塞进他人合集，
+        // 而协作者身份会立刻通过 CollectionAccessGuard 授予该合集的全部写权限。
+        requireManageableCollection(collectionId);
         if (userMapper.selectById(userId) == null) {
             throw new BusinessException(404, "用户不存在");
         }
@@ -185,6 +210,8 @@ public class CollectionServiceImpl implements CollectionService {
     @Override
     @Transactional
     public void removeMember(Long collectionId, Long userId) {
+        // 与指派同样要求对象级管理权，避免把他人合集的合法协作者踢下线（拒绝服务）
+        requireManageableCollection(collectionId);
         memberMapper.delete(new LambdaQueryWrapper<CollectionMember>()
                 .eq(CollectionMember::getCollectionId, collectionId)
                 .eq(CollectionMember::getUserId, userId));
@@ -194,6 +221,14 @@ public class CollectionServiceImpl implements CollectionService {
     @Override
     @Transactional
     public void reorderCollections(List<Map<String, Object>> orderList) {
+        if (orderList == null || orderList.isEmpty()) {
+            return;
+        }
+        // 逐条校验管理权：排序是全局可见的改动，不能对他人合集下手
+        for (Map<String, Object> item : orderList) {
+            Long id = ((Number) item.get("id")).longValue();
+            requireManageableCollection(id);
+        }
         for (Map<String, Object> item : orderList) {
             Long id = ((Number) item.get("id")).longValue();
             Integer sortOrder = ((Number) item.get("sortOrder")).intValue();
@@ -244,8 +279,8 @@ public class CollectionServiceImpl implements CollectionService {
     @Override
     @Transactional
     public CollectionDTO updateCollection(Long id, CollectionDTO dto) {
-        // 资源级判定：不可见即不可管理，按"不存在"处理（避免通过响应差异推断资源存在性）
-        PhotoCollection collection = requireAccessibleCollection(id);
+        // 资源级判定：不可管理即按"不存在"处理（避免通过响应差异推断资源存在性）
+        PhotoCollection collection = requireManageableCollection(id);
         Integer previousPrivate = collection.getIsPrivate();
         if (dto.getName() != null) collection.setName(dto.getName());
         if (dto.getDescription() != null) collection.setDescription(dto.getDescription());
@@ -274,8 +309,18 @@ public class CollectionServiceImpl implements CollectionService {
     @Override
     @Transactional
     public void deleteCollection(Long id) {
-        // 资源级判定：不可见即不可管理，按"不存在"处理
-        requireAccessibleCollection(id);
+        // 资源级判定：不可管理即按"不存在"处理
+        requireManageableCollection(id);
+        // 派生关系一并清理：这些表没有外键兜底，合集删除后残留会变成
+        // "幽灵协作者 / 幽灵授权 / 死分享"，一旦 id 复用就会作用到新合集上
+        memberMapper.delete(new LambdaQueryWrapper<CollectionMember>()
+                .eq(CollectionMember::getCollectionId, id));
+        authTupleMapper.delete(new LambdaQueryWrapper<AuthTuple>()
+                .eq(AuthTuple::getObjectType, PermissionConstants.TARGET_COLLECTION)
+                .eq(AuthTuple::getObjectId, id));
+        shareLinkMapper.delete(new LambdaQueryWrapper<ShareLink>()
+                .eq(ShareLink::getTargetType, "collection")
+                .eq(ShareLink::getTargetId, id));
         LambdaQueryWrapper<PhotoCollectionPhoto> wrapper = new LambdaQueryWrapper<>();
         wrapper.eq(PhotoCollectionPhoto::getCollectionId, id);
         collectionPhotoMapper.delete(wrapper);
@@ -285,8 +330,8 @@ public class CollectionServiceImpl implements CollectionService {
     @Override
     @Transactional
     public void addPhoto(Long collectionId, Long photoId) {
-        // 资源级判定：不可见即不可管理（合集与照片都要在调用者可见范围内）
-        PhotoCollection collection = requireAccessibleCollection(collectionId);
+        // 资源级判定：不可管理即不可写（合集与照片都要在调用者可见范围内）
+        PhotoCollection collection = requireManageableCollection(collectionId);
         com.photoalbum.entity.Photo target = photoMapper.selectById(photoId);
         if (target == null || !accessPolicy.canViewPhoto(getCurrentUser(), target)) {
             throw new BusinessException(404, "照片不存在");
@@ -313,8 +358,8 @@ public class CollectionServiceImpl implements CollectionService {
     @Override
     @Transactional
     public void removePhoto(Long collectionId, Long photoId) {
-        // 资源级判定：不可见即不可管理
-        requireAccessibleCollection(collectionId);
+        // 资源级判定：不可管理即不可写
+        requireManageableCollection(collectionId);
         LambdaQueryWrapper<PhotoCollectionPhoto> wrapper = new LambdaQueryWrapper<>();
         wrapper.eq(PhotoCollectionPhoto::getCollectionId, collectionId)
                 .eq(PhotoCollectionPhoto::getPhotoId, photoId);

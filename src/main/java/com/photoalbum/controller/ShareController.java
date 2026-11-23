@@ -106,6 +106,12 @@ public class ShareController {
     @PreAuthorize("hasAuthority('photo:manage')")
     public Result<ShareLinkDTO> createShareLink(@PathVariable Long photoId,
                                                 @RequestBody(required = false) Map<String, Object> body) {
+        // 与公开入口同一可见性口径：无权访问（含私密照片）一律按不存在处理。
+        // 否则仅持 photo:manage、却没有 photo:view_private 的账号，可借响应里的
+        // 预签名地址读到本应对它 404 的私密照片（用一个能力位绕过另一个能力位）。
+        if (photoService.getVisiblePhoto(photoId) == null) {
+            return Result.fail(404, "照片不存在");
+        }
         if (!RateLimiter.tryAcquire("share-create:" + currentUserKey(),
                 SHARE_MAX_ATTEMPTS, SHARE_WINDOW_MS, SHARE_LOCK_MS)) {
             return Result.fail(429, "操作过于频繁，请稍后再试");
@@ -152,23 +158,24 @@ public class ShareController {
     }
 
     /**
-     * 公开访问分享链接
-     * GET /api/share/{code}
-     */
-    /**
      * 创建（或更新）合集分享链接
      *
      * includePrivate=true 时分享内含私密照片（以创建者可见集为准，扣除其黑名单命中的照片）；
      * accessCode 可选，设置后访问该链接需携带正确口令。
+     *
+     * 参数走请求体而不用查询参数：口令若出现在 URL 里，会落进 Nginx/WAF/APM 的访问日志、
+     * 浏览器历史与任何中间代理，等于把"唯一访问门槛"公开成日志级凭证。
      */
     @PostMapping("/api/admin/share/collection/{collectionId}")
     @PreAuthorize("hasAuthority('photo:manage')")
     public Result<ShareLinkDTO> createCollectionShare(@PathVariable Long collectionId,
-            @RequestParam(required = false) String expiresAt,
-            @RequestParam(required = false, defaultValue = "false") Boolean includePrivate,
-            @RequestParam(required = false) String accessCode) {
+            @RequestBody(required = false) Map<String, Object> body) {
+        Map<String, Object> params = body == null ? Map.of() : body;
+        String expiresAt = params.get("expiresAt") == null ? null : String.valueOf(params.get("expiresAt"));
         java.time.LocalDateTime expiry = (expiresAt == null || expiresAt.isBlank())
                 ? null : java.time.LocalDateTime.parse(expiresAt.trim());
+        Boolean includePrivate = params.get("includePrivate") instanceof Boolean flag && flag;
+        String accessCode = params.get("accessCode") == null ? null : String.valueOf(params.get("accessCode"));
         return Result.ok(shareService.createCollectionShare(collectionId, expiry, includePrivate, accessCode));
     }
 
@@ -197,9 +204,16 @@ public class ShareController {
                 .build();
     }
 
+    /**
+     * 公开访问分享链接
+     * GET /api/share/{code}
+     *
+     * 访问口令通过请求头 X-Share-Access-Code 传递，**不再接受查询参数**：
+     * 查询串里的口令会进入各级访问日志与浏览器历史，而口令是这类分享唯一的访问门槛。
+     */
     @GetMapping("/api/share/{code}")
     public Result<ShareLinkDTO> getShareLink(@PathVariable String code,
-            @RequestParam(required = false) String accessCode,
+            @RequestHeader(value = "X-Share-Access-Code", required = false) String accessCode,
             jakarta.servlet.http.HttpServletRequest request) {
         // 先限流再比对：口令校验属凭据比对，限流缺失时短口令可被高速穷举（修复 H02）
         if (!allowShareAccess(code, request)) {
