@@ -1,7 +1,10 @@
 package com.photoalbum.common;
 
 /**
- * 授权条目取值定义（t_user_permission）
+ * 授权条目取值定义（权威表：t_auth_tuple）
+ *
+ * 注意：历史的 t_user_permission 已废弃（V2 起授权平移为关系元组），
+ * 判定层只读 t_auth_tuple；在旧表上增删授权不会生效。
  *
  * 语义（默认拒绝模型）：
  *   · 白名单（W）定义"可见范围"：global = 全部私密内容；photo/collection/category = 指定对象

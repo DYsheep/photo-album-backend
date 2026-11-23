@@ -34,6 +34,16 @@ public class StartupSecurityChecks implements InitializingBean {
 
     private final Environment environment;
 
+    /**
+     * 仓库测试配置里使用的固定 JWT 密钥
+     *
+     * 它长度达标、字符也够多样，能通过 JwtUtil 的全部校验；一旦被打进部署包或误启用
+     * test profile，看过仓库的人就能签发管理员令牌。因此只在这里（生产 profile 下）拦截，
+     * 而不是放进 JwtUtil 的全局禁用清单——那样会让测试环境起不来。
+     */
+    private static final String COMMITTED_TEST_SECRET =
+            "TestSecretKeyForJwtTokenGenerationMustBeLongEnough!";
+
     @Override
     public void afterPropertiesSet() {
         if (!strict()) {
@@ -43,6 +53,13 @@ public class StartupSecurityChecks implements InitializingBean {
                 "生产环境禁止使用空数据库口令（默认值即空串），请通过环境变量 DB_PASSWORD 注入");
         requireNonBlank("jwt.secret", "JWT_SECRET",
                 "生产环境必须显式注入 JWT 密钥，否则每次重启会生成一次性随机密钥，多实例间令牌互不通用");
+
+        String jwtSecret = environment.getProperty("jwt.secret", "");
+        if (COMMITTED_TEST_SECRET.equals(jwtSecret)) {
+            throw new IllegalStateException(
+                    "生产环境正在使用仓库测试配置里的固定 JWT 密钥，任何看过代码的人都能伪造管理员令牌，"
+                            + "请通过环境变量 JWT_SECRET 注入随机值（head -c 48 /dev/urandom | base64 -w0）");
+        }
 
         String dbUser = environment.getProperty("spring.datasource.username", "");
         if ("root".equalsIgnoreCase(dbUser)) {

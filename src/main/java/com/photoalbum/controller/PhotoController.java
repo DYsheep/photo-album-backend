@@ -36,6 +36,11 @@ public class PhotoController {
     private static final long LIKE_WINDOW_MS = 60_000L;
     private static final long LIKE_LOCK_MS = 300_000L;
 
+    /** 列表限流：单来源每分钟 120 次（匿名可读，且关键词搜索是 LIKE '%kw%' 全表扫描） */
+    private static final int LIST_MAX_ATTEMPTS = 120;
+    private static final long LIST_WINDOW_MS = 60_000L;
+    private static final long LIST_LOCK_MS = 300_000L;
+
     private final PhotoService photoService;
     private final CategoryMapper categoryMapper;
     private final ClientIpResolver clientIpResolver;
@@ -46,7 +51,12 @@ public class PhotoController {
      */
     @GetMapping
     @SuppressWarnings("unchecked")
-    public Result<?> list(PhotoDTO dto) {
+    public Result<?> list(PhotoDTO dto, jakarta.servlet.http.HttpServletRequest request) {
+        // 匿名可读 + 关键词搜索无法走索引，不限流时可被反复请求打满 CPU
+        String ip = clientIpResolver.resolve(request);
+        if (!RateLimiter.tryAcquire("photo-list:ip:" + ip, LIST_MAX_ATTEMPTS, LIST_WINDOW_MS, LIST_LOCK_MS)) {
+            return Result.fail(429, "请求过于频繁，请稍后再试");
+        }
         Object data = photoService.getPhotoPage(dto);
         return Result.ok((Map<String, Object>) data);
     }

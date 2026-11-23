@@ -15,6 +15,8 @@ import com.photoalbum.mapper.UserMapper;
 import com.photoalbum.security.AccessPolicy;
 import com.photoalbum.security.CurrentUserSupport;
 import com.photoalbum.security.ShareLinkPolicy;
+import com.photoalbum.common.UserRoles;
+import com.photoalbum.service.AuditService;
 import com.photoalbum.service.PhotoUrlResolver;
 import com.photoalbum.service.ShareService;
 import lombok.RequiredArgsConstructor;
@@ -64,6 +66,7 @@ public class ShareServiceImpl implements ShareService {
     private final PhotoMapper photoMapper;
     private final AccessPolicy accessPolicy;
     private final PhotoUrlResolver photoUrlResolver;
+    private final AuditService auditService;
 
     @Value("${share.base-url:http://localhost:5173}")
     private String shareBaseUrl;
@@ -115,9 +118,15 @@ public class ShareServiceImpl implements ShareService {
         if (existing != null) {
             existing.setExpiresAt(normalizedExpiry);
             existing.setCreatedBy(operator != null ? operator.getId() : null);
+            // 顺带补上 target_* 字段：V3 之前的老行只有 photo_id，新建行此前也只写 photo_id，
+            // 导致 idx_share_target 永远命中不了照片分享
+            existing.setTargetType("photo");
+            existing.setTargetId(photoId);
             shareLinkMapper.updateById(existing);
             log.info("分享链接有效期已更新: photoId={}, code={}, expiresAt={}",
-                    photoId, existing.getCode(), normalizedExpiry);
+                    photoId, maskCode(existing.getCode()), normalizedExpiry);
+            auditService.record(AuditService.ACTION_SHARE_UPDATE, AuditService.TARGET_SHARE, existing.getId(),
+                    String.format("更新照片分享 photoId=%d，有效期=%s", photoId, normalizedExpiry));
             return buildDto(existing, photo);
         }
 
@@ -127,12 +136,16 @@ public class ShareServiceImpl implements ShareService {
         ShareLink shareLink = new ShareLink();
         shareLink.setCode(code);
         shareLink.setPhotoId(photoId);
+        shareLink.setTargetType("photo");
+        shareLink.setTargetId(photoId);
         shareLink.setExpiresAt(normalizedExpiry);
         shareLink.setCreatedAt(LocalDateTime.now());
         shareLink.setCreatedBy(operator != null ? operator.getId() : null);
 
         shareLinkMapper.insert(shareLink);
-        log.info("分享链接创建成功: photoId={}, code={}, expiresAt={}", photoId, code, normalizedExpiry);
+        log.info("分享链接创建成功: photoId={}, code={}, expiresAt={}", photoId, maskCode(code), normalizedExpiry);
+        auditService.record(AuditService.ACTION_SHARE_CREATE, AuditService.TARGET_SHARE, shareLink.getId(),
+                String.format("创建照片分享 photoId=%d，有效期=%s", photoId, normalizedExpiry));
 
         return buildDto(shareLink, photo);
     }
@@ -241,7 +254,10 @@ public class ShareServiceImpl implements ShareService {
             existing.setCreatedBy(creator != null ? creator.getId() : null);
             shareLinkMapper.updateById(existing);
             log.info("合集分享已更新: collectionId={}, code={}, includePrivate={}, expiresAt={}",
-                    collectionId, existing.getCode(), withPrivate, normalizedExpiry);
+                    collectionId, maskCode(existing.getCode()), withPrivate, normalizedExpiry);
+            auditService.record(AuditService.ACTION_SHARE_UPDATE, AuditService.TARGET_SHARE, existing.getId(),
+                    String.format("更新合集分享 collectionId=%d，含私密=%s，有效期=%s",
+                            collectionId, withPrivate, normalizedExpiry));
             return buildCollectionDto(existing, collection);
         }
 
@@ -257,7 +273,10 @@ public class ShareServiceImpl implements ShareService {
         shareLink.setCreatedBy(creator != null ? creator.getId() : null);
         shareLinkMapper.insert(shareLink);
         log.info("合集分享创建成功: collectionId={}, code={}, includePrivate={}, expiresAt={}",
-                collectionId, shareLink.getCode(), withPrivate, normalizedExpiry);
+                collectionId, maskCode(shareLink.getCode()), withPrivate, normalizedExpiry);
+        auditService.record(AuditService.ACTION_SHARE_CREATE, AuditService.TARGET_SHARE, shareLink.getId(),
+                String.format("创建合集分享 collectionId=%d，含私密=%s，有效期=%s",
+                        collectionId, withPrivate, normalizedExpiry));
         return buildCollectionDto(shareLink, collection);
     }
 
@@ -341,8 +360,16 @@ public class ShareServiceImpl implements ShareService {
 
     @Override
     public List<ShareLinkDTO> getShareLinks() {
-        List<ShareLink> shareLinks = shareLinkMapper.selectList(
-                new LambdaQueryWrapper<ShareLink>().orderByDesc(ShareLink::getCreatedAt));
+        User operator = CurrentUserSupport.getCurrentUser();
+        LambdaQueryWrapper<ShareLink> wrapper = new LambdaQueryWrapper<ShareLink>()
+                .orderByDesc(ShareLink::getCreatedAt);
+        // 数据范围：非管理员只能看到自己创建的分享。
+        // 此前无任何过滤，任何具备内容管理能力的账号都能枚举全站分享码（无口令的码即访问凭证）。
+        if (operator != null && !UserRoles.isAdmin(operator.getRole())) {
+            wrapper.eq(ShareLink::getCreatedBy, operator.getId());
+        }
+
+        List<ShareLink> shareLinks = shareLinkMapper.selectList(wrapper);
 
         return shareLinks.stream().map(sl -> {
             ShareLinkDTO dto = toDTO(sl);
@@ -374,8 +401,25 @@ public class ShareServiceImpl implements ShareService {
         if (shareLink == null) {
             throw new BusinessException(404, "分享链接不存在");
         }
+        // 归属校验：非管理员只能撤销自己创建的分享（此前任何 canManage 账号都能删他人的）
+        User operator = CurrentUserSupport.getCurrentUser();
+        boolean admin = operator != null && UserRoles.isAdmin(operator.getRole());
+        if (!admin && (operator == null || !operator.getId().equals(shareLink.getCreatedBy()))) {
+            throw new BusinessException(404, "分享链接不存在");
+        }
         shareLinkMapper.deleteById(id);
-        log.info("分享链接已删除: id={}, code={}", id, shareLink.getCode());
+        log.info("分享链接已删除: id={}, code={}", id, maskCode(shareLink.getCode()));
+        auditService.record(AuditService.ACTION_SHARE_DELETE, AuditService.TARGET_SHARE, id,
+                String.format("删除分享 code=%s（target=%s#%s）",
+                        maskCode(shareLink.getCode()), shareLink.getTargetType(), shareLink.getTargetId()));
+    }
+
+    /** 日志脱敏：分享码本身即访问凭证（无口令分享凭码即可访问），不得明文入日志 */
+    private String maskCode(String code) {
+        if (code == null || code.length() <= 2) {
+            return "***";
+        }
+        return code.substring(0, 2) + "***";
     }
 
     /**

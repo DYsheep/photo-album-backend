@@ -8,12 +8,14 @@ import com.photoalbum.entity.AuthTuple;
 import com.photoalbum.entity.Photo;
 import com.photoalbum.entity.PhotoTag;
 import com.photoalbum.entity.Tag;
+import com.photoalbum.entity.User;
 import com.photoalbum.mapper.AuthTupleMapper;
 import com.photoalbum.mapper.PhotoMapper;
 import com.photoalbum.mapper.PhotoTagMapper;
 import com.photoalbum.mapper.TagMapper;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import com.photoalbum.security.CurrentUserSupport;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -33,7 +35,7 @@ import java.util.stream.Collectors;
  *     · 写路径（上传/编辑/批量追加）双写：关联表 + 展示用冗余字段；
  *     · 标签管理（重命名/合并/删除）改走关联表，照片的冗余字段按需重写；
  *     · 统计（各标签引用数）走关联表聚合，不再全表扫描解析字符串；
- *     · 标签级授权（t_user_permission.target_type='tag'）以关联表为准做级联。
+ *     · 标签级授权（t_auth_tuple 中 object_type='tag' 的关系元组）以关联表为准做级联。
  *
  * 过渡说明：列表/详情等读路径仍使用 t_photo.tags 冗余字段展示（零性能回退），
  * 若出现数据漂移，可调用 rebuildIndex() 以冗余字段为准重建关联表。
@@ -47,6 +49,7 @@ public class TagService {
     private final PhotoTagMapper photoTagMapper;
     private final PhotoMapper photoMapper;
     private final AuthTupleMapper authTupleMapper;
+    private final com.photoalbum.security.AccessPolicy accessPolicy;
 
     // ========== 写路径：同步 ==========
 
@@ -126,17 +129,21 @@ public class TagService {
 
     // ========== 读路径：管理端列表 ==========
 
-    /** 各标签的引用数（关联表聚合，不再全表扫描字符串） */
+    /** 各标签的引用数（按当前调用者的可见范围统计，不泄漏私密照片数量） */
     public List<Map<String, Object>> listWithCounts() {
-        Map<Long, Long> counts = photoTagMapper.selectMaps(new QueryWrapper<PhotoTag>()
-                        .select("tag_id", "COUNT(*) AS cnt")
-                        .groupBy("tag_id"))
-                .stream()
-                .collect(Collectors.toMap(
-                        row -> ((Number) row.get("tag_id")).longValue(),
-                        row -> ((Number) row.get("cnt")).longValue()));
+        User user = CurrentUserSupport.getCurrentUser();
+        List<Tag> tags = tagMapper.selectList(null);
+        Map<Long, Long> counts = new java.util.HashMap<>();
+        for (Tag tag : tags) {
+            // 计数走与列表/详情同一个可见性策略：此前直接对 t_photo_tag 全表聚合，
+            // 与"我可见的照片数"做差集即可反推私密照片的标签分布与规模。
+            LambdaQueryWrapper<Photo> wrapper = new LambdaQueryWrapper<Photo>()
+                    .inSql(Photo::getId, "SELECT photo_id FROM t_photo_tag WHERE tag_id = " + tag.getId());
+            accessPolicy.applyPhotoFilter(wrapper, user);
+            counts.put(tag.getId(), photoMapper.selectCount(wrapper));
+        }
 
-        return tagMapper.selectList(null).stream()
+        return tags.stream()
                 .map(tag -> {
                     Map<String, Object> item = new java.util.HashMap<>();
                     // 同时返回 id：标签级授权需要以标签 ID 作为授权对象

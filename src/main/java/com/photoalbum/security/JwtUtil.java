@@ -40,6 +40,9 @@ public class JwtUtil {
             "changeme", "secret", "jwt-secret", "123456"
     );
 
+    /** 密钥字符多样性下限：低于该值视为"等长重复字符串"，熵远达不到 HS256 要求 */
+    private static final int MIN_DISTINCT_CHARS = 10;
+
     @Value("${jwt.secret:}")
     private String secret;
 
@@ -83,6 +86,16 @@ public class JwtUtil {
             throw new IllegalStateException(
                     "jwt.secret 长度不足：HS256 至少需要 " + MIN_SECRET_BYTES + " 字节，当前为 "
                             + keyBytes.length + " 字节，请重新生成更长的随机密钥");
+        }
+
+        // 4. 熵检查：长度达标但字符多样性极低（例如 32 个相同字符）在字典/离线爆破下
+        //    等价于弱密钥。HS256 要求的是密钥熵，不是密钥长度。
+        long distinctChars = value.chars().distinct().count();
+        if (distinctChars < MIN_DISTINCT_CHARS) {
+            throw new IllegalStateException(
+                    "jwt.secret 字符多样性过低（仅 " + distinctChars + " 种不同字符），"
+                            + "等长重复串的实际强度远低于 HS256 要求，请改用随机生成的值"
+                            + "（例如 head -c 48 /dev/urandom | base64 -w0）");
         }
 
         this.signingKey = Keys.hmacShaKeyFor(keyBytes);

@@ -68,6 +68,10 @@ class ShareLinkSecurityRulesTest {
     @Mock
     private COSClient cosClient;
 
+    /** 分享的创建/更新会写审计，单测中为无操作 */
+    @Mock
+    private com.photoalbum.service.AuditService auditService;
+
     @InjectMocks
     private ShareServiceImpl shareService;
 

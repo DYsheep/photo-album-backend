@@ -115,8 +115,12 @@ public class AdminUserController {
     /** 删除权限条目 */
     @DeleteMapping("/{id}/permissions/{permId}")
     public Result<Void> removePermission(@PathVariable Long id, @PathVariable Long permId) {
-        userService.removePermission(permId);
-        return Result.ok();
+        try {
+            userService.removePermission(id, permId);
+            return Result.ok();
+        } catch (BusinessException e) {
+            return Result.fail(e.getCode(), e.getMessage());
+        }
     }
 
     private UserUpsertDTO buildUpsert(Map<String, String> body, boolean creating) {

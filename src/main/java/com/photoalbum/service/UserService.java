@@ -41,6 +41,6 @@ public interface UserService {
     /** 添加权限条目 */
     void addPermission(Long userId, String permType, String targetType, Long targetId);
 
-    /** 删除权限条目 */
-    void removePermission(Long permId);
+    /** 删除权限条目（必须同时给出归属账号，避免按 id 误删他人条目） */
+    void removePermission(Long userId, Long permId);
 }

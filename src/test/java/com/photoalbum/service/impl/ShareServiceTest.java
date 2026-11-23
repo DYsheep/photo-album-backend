@@ -8,6 +8,7 @@ import com.photoalbum.entity.ShareLink;
 import com.photoalbum.mapper.PhotoMapper;
 import com.photoalbum.mapper.ShareLinkMapper;
 import com.photoalbum.security.AccessPolicy;
+import com.photoalbum.service.AuditService;
 import com.photoalbum.service.PhotoUrlResolver;
 import com.qcloud.cos.COSClient;
 import org.junit.jupiter.api.*;
@@ -54,6 +55,10 @@ class ShareServiceTest {
 
     @Mock
     private com.photoalbum.mapper.PhotoCollectionPhotoMapper collectionPhotoMapper;
+
+    /** 分享的创建/更新/删除都要写审计，单测中为无操作 */
+    @Mock
+    private AuditService auditService;
 
     @Mock
     private com.photoalbum.mapper.UserMapper userMapper;
@@ -512,6 +517,48 @@ class ShareServiceTest {
     @Nested
     @DisplayName("deleteShareLink() - 删除分享链接")
     class DeleteShareLinkTests {
+
+        /**
+         * 删除分享要求"管理员或分享创建人"。单测统一以管理员身份执行，
+         * 归属校验的拒绝路径另行覆盖（非管理员删除他人分享 → 404）。
+         */
+        @org.junit.jupiter.api.BeforeEach
+        void authenticateAsAdmin() {
+            com.photoalbum.entity.User admin = new com.photoalbum.entity.User();
+            admin.setId(1L);
+            admin.setUsername("admin");
+            admin.setRole("admin");
+            org.springframework.security.core.context.SecurityContextHolder.getContext()
+                    .setAuthentication(new org.springframework.security.authentication
+                            .UsernamePasswordAuthenticationToken(admin, null, java.util.List.of()));
+        }
+
+        @org.junit.jupiter.api.AfterEach
+        void clearAuthentication() {
+            org.springframework.security.core.context.SecurityContextHolder.clearContext();
+        }
+
+        @Test
+        @DisplayName("非管理员删除他人创建的分享，应按不存在处理（404）")
+        void shouldRejectDeletingOthersShare() {
+            Long shareId = 7L;
+            ShareLink others = buildShareLink(shareId, "Other001", 10L);
+            others.setCreatedBy(99L); // 属于别人
+            when(shareLinkMapper.selectById(shareId)).thenReturn(others);
+
+            com.photoalbum.entity.User operator = new com.photoalbum.entity.User();
+            operator.setId(2L);
+            operator.setUsername("editor");
+            operator.setRole("user");
+            org.springframework.security.core.context.SecurityContextHolder.getContext()
+                    .setAuthentication(new org.springframework.security.authentication
+                            .UsernamePasswordAuthenticationToken(operator, null, java.util.List.of()));
+
+            BusinessException ex = assertThrows(BusinessException.class,
+                    () -> shareService.deleteShareLink(shareId));
+            assertEquals(404, ex.getCode());
+            verify(shareLinkMapper, never()).deleteById(anyLong());
+        }
 
         @Test
         @DisplayName("正常删除存在的分享链接，删除后再次查询应抛异常")

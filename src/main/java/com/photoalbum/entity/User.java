@@ -1,6 +1,7 @@
 package com.photoalbum.entity;
 
 import com.baomidou.mybatisplus.annotation.*;
+import com.fasterxml.jackson.annotation.JsonIgnore;
 import lombok.Data;
 
 import java.time.LocalDateTime;
@@ -19,6 +20,8 @@ public class User {
     private Long id;
 
     private String username;
+    /** BCrypt 口令哈希：禁止序列化，避免将来某个接口直接返回实体时把哈希带出去 */
+    @JsonIgnore
     private String password;
     private String nickname;
     private String avatar;

@@ -69,8 +69,13 @@ public class SecurityConfig {
                 .requestMatchers("/api/admin/**").hasAuthority("admin:access")
                 // 其余 /api/** 接口均需认证（任何已登录用户）
                 .requestMatchers("/api/**").authenticated()
-                // 其他路径放行
-                .anyRequest().permitAll()
+                // 分享页 SSR（后端渲染 og 卡片元数据，供社交平台抓取）
+                .requestMatchers(HttpMethod.GET, "/share/**").permitAll()
+                // Spring Boot 错误分发入口
+                .requestMatchers("/error").permitAll()
+                // 其他路径一律拒绝：此前是 permitAll，将来任何新增端点（如 actuator）
+                // 都会默认对外裸奔。真实静态资源由 Nginx 托管，不经过本应用。
+                .anyRequest().denyAll()
             )
 
             // 注册 JWT 过滤器（在 UsernamePasswordFilter 之前）

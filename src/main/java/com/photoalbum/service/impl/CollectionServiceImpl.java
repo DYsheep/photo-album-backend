@@ -250,7 +250,27 @@ public class CollectionServiceImpl implements CollectionService {
         wp.eq(PhotoCollectionPhoto::getCollectionId, collectionId)
                 .orderByAsc(PhotoCollectionPhoto::getSortOrder);
         List<PhotoCollectionPhoto> relations = collectionPhotoMapper.selectList(wp);
-        List<Long> ids = relations.stream().map(PhotoCollectionPhoto::getPhotoId).collect(Collectors.toList());
+        List<Long> orderedIds = relations.stream()
+                .map(PhotoCollectionPhoto::getPhotoId)
+                .filter(id -> id != null)
+                .distinct()
+                .collect(Collectors.toList());
+
+        // 逐张做可见性判定：此前直接返回相邻 ID，沿链遍历即可把合集内
+        // 对访问者不可见的私密照片 ID 全部收集出来（内容是 404 的，但 ID 泄漏了）
+        List<Long> ids = new ArrayList<>();
+        if (!orderedIds.isEmpty()) {
+            Map<Long, Photo> photoById = photoMapper.selectBatchIds(orderedIds).stream()
+                    .collect(Collectors.toMap(Photo::getId, photo -> photo));
+            User user = getCurrentUser();
+            for (Long id : orderedIds) {
+                Photo photo = photoById.get(id);
+                if (photo != null && accessPolicy.canViewPhotoInCollection(user, photo, collectionId)) {
+                    ids.add(id);
+                }
+            }
+        }
+
         int idx = ids.indexOf(photoId);
         result.put("prevId", idx > 0 ? ids.get(idx - 1) : null);
         result.put("nextId", idx >= 0 && idx < ids.size() - 1 ? ids.get(idx + 1) : null);

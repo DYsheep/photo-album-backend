@@ -56,6 +56,10 @@ public class ShareController {
     private static final long ACCESS_WINDOW_MS = 300_000L;
     private static final long ACCESS_LOCK_MS = 900_000L;
 
+    /** 匿名图片端点（封面 / 二维码）限流：同一来源 5 分钟 300 次 */
+    private static final int ASSET_MAX_ATTEMPTS = 300;
+    private static final long ASSET_WINDOW_MS = 300_000L;
+
     private final ShareService shareService;
     private final PhotoService photoService;
     private final ShareCardService shareCardService;
@@ -172,8 +176,14 @@ public class ShareController {
             @RequestBody(required = false) Map<String, Object> body) {
         Map<String, Object> params = body == null ? Map.of() : body;
         String expiresAt = params.get("expiresAt") == null ? null : String.valueOf(params.get("expiresAt"));
-        java.time.LocalDateTime expiry = (expiresAt == null || expiresAt.isBlank())
-                ? null : java.time.LocalDateTime.parse(expiresAt.trim());
+        java.time.LocalDateTime expiry;
+        try {
+            expiry = (expiresAt == null || expiresAt.isBlank())
+                    ? null : java.time.LocalDateTime.parse(expiresAt.trim());
+        } catch (DateTimeParseException e) {
+            // 此前解析异常会冒泡成 500，这里统一收敛为参数错误
+            return Result.fail(400, "到期时间格式不正确，应为 YYYY-MM-DD 或 ISO 日期时间");
+        }
         Boolean includePrivate = params.get("includePrivate") instanceof Boolean flag && flag;
         String accessCode = params.get("accessCode") == null ? null : String.valueOf(params.get("accessCode"));
         return Result.ok(shareService.createCollectionShare(collectionId, expiry, includePrivate, accessCode));
@@ -189,7 +199,11 @@ public class ShareController {
      * 取不到封面时（链接失效、需口令、无可见照片）退回站点默认图，不暴露任何信息。
      */
     @GetMapping("/api/share/{code}/cover")
-    public ResponseEntity<byte[]> shareCover(@PathVariable String code) {
+    public ResponseEntity<byte[]> shareCover(@PathVariable String code,
+            jakarta.servlet.http.HttpServletRequest request) {
+        if (!allowShareAsset(request)) {
+            return ResponseEntity.status(HttpStatus.TOO_MANY_REQUESTS).build();
+        }
         PhotoUrlResolver.ObjectData image = shareCardService.coverImageOf(code);
         if (image != null && image.bytes() != null && image.bytes().length > 0) {
             return ResponseEntity.ok()
@@ -214,15 +228,24 @@ public class ShareController {
     @GetMapping("/api/share/{code}")
     public Result<ShareLinkDTO> getShareLink(@PathVariable String code,
             @RequestHeader(value = "X-Share-Access-Code", required = false) String accessCode,
-            jakarta.servlet.http.HttpServletRequest request) {
-        // 先限流再比对：口令校验属凭据比对，限流缺失时短口令可被高速穷举（修复 H02）
-        if (!allowShareAccess(code, request)) {
-            return Result.fail(429, "尝试次数过多，请15分钟后再试");
-        }
+            jakarta.servlet.http.HttpServletRequest request,
+            jakarta.servlet.http.HttpServletResponse response) {
+        // 响应体里含照片地址（私密照片是短期签名地址），禁止中间层与浏览器缓存
+        response.setHeader("Cache-Control", "no-store");
+
         try {
             ShareLinkDTO dto = shareService.getByCode(code, accessCode);
+            // 访问成功即清掉该来源的失败计数
+            clearShareAccess(code, request);
             return Result.ok(dto);
         } catch (BusinessException e) {
+            // 只有"确实携带了口令且校验失败"才计入尝试次数：
+            // 分享页首屏会用空口令探测一次（判断是否需要口令面板），此前这次也计数，
+            // 正常访客刷新几次就会把自己锁 15 分钟；而不带口令的探测也不构成穷举行为。
+            boolean realAttempt = accessCode != null && !accessCode.isBlank();
+            if (e.getCode() == 403 && realAttempt && !allowShareAccess(code, request)) {
+                return Result.fail(429, "尝试次数过多，请15分钟后再试");
+            }
             return Result.fail(e.getCode(), e.getMessage());
         }
     }
@@ -246,6 +269,25 @@ public class ShareController {
         return byCode && byIp;
     }
 
+    /** 访问成功后重置"该来源对该分享码"的失败计数（来源级预算仍按窗口自然衰减） */
+    private void clearShareAccess(String code, jakarta.servlet.http.HttpServletRequest request) {
+        String ip = clientIpResolver.resolve(request);
+        String normalizedCode = code == null ? "" : code.trim();
+        RateLimiter.clear("share-access:code:" + normalizedCode + ":" + ip);
+    }
+
+    /**
+     * 匿名图片端点限流（封面 / 二维码）
+     *
+     * 这两个端点无需登录，且每次请求要么现场向对象存储取字节、要么现场渲染 PNG，
+     * 不限流就是匿名可用的资源放大点。
+     */
+    private boolean allowShareAsset(jakarta.servlet.http.HttpServletRequest request) {
+        String ip = clientIpResolver.resolve(request);
+        return RateLimiter.tryAcquire("share-asset:ip:" + ip,
+                ASSET_MAX_ATTEMPTS, ASSET_WINDOW_MS, ACCESS_LOCK_MS);
+    }
+
     /**
      * 分享页二维码
      * GET /api/share/{code}/qrcode
@@ -253,7 +295,11 @@ public class ShareController {
      * 印在前端生成的分享卡片图上（扫码打开分享页），同样必须 200 直出图片。
      */
     @GetMapping("/api/share/{code}/qrcode")
-    public ResponseEntity<byte[]> shareQrCode(@PathVariable String code) {
+    public ResponseEntity<byte[]> shareQrCode(@PathVariable String code,
+            jakarta.servlet.http.HttpServletRequest request) {
+        if (!allowShareAsset(request)) {
+            return ResponseEntity.status(HttpStatus.TOO_MANY_REQUESTS).build();
+        }
         byte[] png = shareCardService.qrcodeOf(code);
         if (png == null || png.length == 0) {
             return ResponseEntity.notFound().build();

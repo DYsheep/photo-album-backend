@@ -16,6 +16,7 @@ import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import org.springframework.mock.web.MockHttpServletRequest;
+import org.springframework.mock.web.MockHttpServletResponse;
 import org.springframework.test.util.ReflectionTestUtils;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -84,9 +85,10 @@ class ShareControllerAccessLimitTest {
 
     private int attemptsWithWrongCode(String code, String ip, int times) {
         MockHttpServletRequest request = requestFrom(ip);
+        MockHttpServletResponse response = new MockHttpServletResponse();
         int lastCode = 0;
         for (int i = 0; i < times; i++) {
-            Result<ShareLinkDTO> result = controller.getShareLink(code, "wrong-code", request);
+            Result<ShareLinkDTO> result = controller.getShareLink(code, "wrong-code", request, response);
             lastCode = result.getCode();
         }
         return lastCode;

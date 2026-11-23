@@ -177,65 +177,70 @@ public class AccessPolicy {
     /**
      * 把照片可见性条件追加到查询条件上（所有照片查询必须调用）
      *
-     * 生成的私密条件形如：
-     *   is_private = 0
-     *   OR (is_private = 1 AND ( id IN (照片白名单…)
-     *         OR category_id IN (SELECT object_id FROM t_auth_tuple WHERE …'category')
-     *         OR EXISTS (SELECT 1 FROM t_collection_photos cp JOIN t_auth_tuple up …) ))
+     * 生成的条件形如：
+     *   (is_private = 0
+     *    OR (is_private = 1 AND ( id IN (照片白名单…)
+     *          OR category_id IN (SELECT object_id FROM t_auth_tuple WHERE …'category')
+     *          OR EXISTS (SELECT 1 FROM t_collection_photos cp JOIN t_auth_tuple up …) )))
+     *   AND <黑名单减法>
+     *
+     * 黑名单（deny）放在最外层，因此对**公开**内容同样生效——与 isCollectionDenied
+     * 注释里的"deny 优先于一切"保持一致。此前 deny 只写在私密分支内，公开对象会
+     * 整体绕开排除项，等于这条安全控制对公开内容失效。
      */
     public void applyPhotoFilter(LambdaQueryWrapper<Photo> wrapper, User user) {
         PrivateScope scope = photoScope(user);
-        if (scope.all() && !scope.hasExclusions()) {
+        List<String> exclusions = exclusionSql(scope, user);
+
+        if (scope.all() && exclusions.isEmpty()) {
             return;
         }
-        String privateCondition = buildPrivateCondition(scope, user);
+
+        String privateCondition = buildPrivateVisibleCondition(scope, user);
         if (privateCondition == null) {
             wrapper.eq(Photo::getIsPrivate, 0);
-            return;
+        } else {
+            wrapper.and(w -> w.eq(Photo::getIsPrivate, 0).or().apply(privateCondition));
         }
-        wrapper.and(w -> w.eq(Photo::getIsPrivate, 0).or().apply(privateCondition));
+
+        if (!exclusions.isEmpty()) {
+            wrapper.apply(String.join(" AND ", exclusions));
+        }
     }
 
     /** 把合集可见性条件追加到查询条件上（公开合集查询必须调用） */
     public void applyCollectionFilter(LambdaQueryWrapper<PhotoCollection> wrapper, User user) {
         PrivateScope scope = collectionScope(user);
+        Set<Long> excluded = scope.excludedCollectionIds();
+
         if (scope.all()) {
-            if (scope.excludedCollectionIds().isEmpty()) {
-                return;
+            // 全部可见，仅扣除 deny（对公开合集同样生效）
+            if (!excluded.isEmpty()) {
+                wrapper.notIn(PhotoCollection::getId, excluded);
             }
-            wrapper.and(w -> w.eq(PhotoCollection::getIsPrivate, 0)
-                    .or(w2 -> w2.eq(PhotoCollection::getIsPrivate, 1)
-                            .notIn(PhotoCollection::getId, scope.excludedCollectionIds())));
             return;
         }
         if (!scope.hasGrants()) {
             wrapper.eq(PhotoCollection::getIsPrivate, 0);
-            return;
+        } else {
+            wrapper.and(w -> w.eq(PhotoCollection::getIsPrivate, 0)
+                    .or().in(PhotoCollection::getId, scope.allowedCollectionIds()));
         }
-        wrapper.and(w -> {
-            w.eq(PhotoCollection::getIsPrivate, 0).or().in(PhotoCollection::getId, scope.allowedCollectionIds());
-            // 黑名单在白名单范围内做减法（AND 优先级高于 OR，等价于 is_private=0 OR (白名单 AND 非黑名单)）
-            if (!scope.excludedCollectionIds().isEmpty()) {
-                w.notIn(PhotoCollection::getId, scope.excludedCollectionIds());
-            }
-        });
+        if (!excluded.isEmpty()) {
+            wrapper.notIn(PhotoCollection::getId, excluded);
+        }
     }
 
     /**
-     * 构造私密照片的可见条件（不含最外层的 is_private = 0）
+     * 构造"可见的私密照片"条件（不含最外层的 is_private = 0，也不含黑名单减法）
      *
      * 说明：SQL 中内联的 userId 与照片 ID 均来自数据库（Long 类型），不接受请求参数，不存在注入面。
      *
      * @return null 表示"无任何私密可见"（调用方应只查公开）
      */
-    private String buildPrivateCondition(PrivateScope scope, User user) {
+    private String buildPrivateVisibleCondition(PrivateScope scope, User user) {
         if (scope.all()) {
-            if (!scope.hasExclusions()) {
-                return null;
-            }
-            List<String> exclusions = exclusionSql(scope, user);
-            return exclusions.isEmpty() ? null
-                    : "is_private = 1 AND " + String.join(" AND ", exclusions);
+            return "is_private = 1";
         }
         if (!scope.hasGrants()) {
             return null;
@@ -255,12 +260,7 @@ public class AccessPolicy {
         if (!scope.allowedTagIds().isEmpty()) {
             grants.add(tagSubQuery(user.getId(), com.photoalbum.entity.AuthTuple.RELATION_ALLOW));
         }
-        String condition = "is_private = 1 AND (" + String.join(" OR ", grants) + ")";
-        List<String> exclusions = exclusionSql(scope, user);
-        if (!exclusions.isEmpty()) {
-            condition += " AND " + String.join(" AND ", exclusions);
-        }
-        return condition;
+        return "is_private = 1 AND (" + String.join(" OR ", grants) + ")";
     }
 
     /** 黑名单排除条件（在可见范围内做减法） */
@@ -319,14 +319,15 @@ public class AccessPolicy {
         if (photo == null) {
             return false;
         }
+        PrivateScope scope = photoScope(user);
+        // deny 优先：黑名单对公开照片同样生效（与 applyPhotoFilter 的外层减法口径一致）
+        if (isExcluded(scope, photo, null)) {
+            return false;
+        }
         if (photo.getIsPrivate() == null || photo.getIsPrivate() == 0) {
             return true;
         }
-        PrivateScope scope = photoScope(user);
         if (!scope.all() && !scope.hasGrants()) {
-            return false;
-        }
-        if (isExcluded(scope, photo, null)) {
             return false;
         }
         if (scope.all()) {
@@ -352,32 +353,32 @@ public class AccessPolicy {
         if (photo == null) {
             return false;
         }
+        PrivateScope scope = photoScope(user);
+        if (isExcluded(scope, photo, collectionId)) {
+            return false;
+        }
         if (photo.getIsPrivate() == null || photo.getIsPrivate() == 0) {
             return true;
         }
-        PrivateScope scope = photoScope(user);
         if (!scope.all() && !scope.hasGrants()) {
-            return false;
-        }
-        if (isExcluded(scope, photo, collectionId)) {
             return false;
         }
         return scope.all() || isGranted(scope, photo, collectionId);
     }
 
-    /** 单个合集是否可见（仅看私密标记） */
+    /** 单个合集是否可见（公开合集同样受 deny 约束） */
     public boolean canViewCollection(User user, PhotoCollection collection) {
         if (collection == null) {
+            return false;
+        }
+        PrivateScope scope = collectionScope(user);
+        if (scope.excludedCollectionIds().contains(collection.getId())) {
             return false;
         }
         if (collection.getIsPrivate() == null || collection.getIsPrivate() == 0) {
             return true;
         }
-        PrivateScope scope = collectionScope(user);
-        if (scope.all()) {
-            return !scope.excludedCollectionIds().contains(collection.getId());
-        }
-        return scope.allowedCollectionIds().contains(collection.getId());
+        return scope.all() || scope.allowedCollectionIds().contains(collection.getId());
     }
 
     /**

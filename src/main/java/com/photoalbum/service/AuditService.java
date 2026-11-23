@@ -38,6 +38,12 @@ public class AuditService {
     public static final String ACTION_USER_UPDATE = "USER_UPDATE";
     /** 动作：删除用户 */
     public static final String ACTION_USER_DELETE = "USER_DELETE";
+    /** 动作：创建分享链接 */
+    public static final String ACTION_SHARE_CREATE = "SHARE_CREATE";
+    /** 动作：更新分享链接（有效期/私密开关/口令） */
+    public static final String ACTION_SHARE_UPDATE = "SHARE_UPDATE";
+    /** 动作：删除分享链接 */
+    public static final String ACTION_SHARE_DELETE = "SHARE_DELETE";
     /** 动作：登录成功 */
     public static final String ACTION_LOGIN_SUCCESS = "LOGIN_SUCCESS";
     /** 动作：登录失败（口令错误或触发限流） */
@@ -49,6 +55,8 @@ public class AuditService {
     public static final String TARGET_USER = "user";
     /** 对象类型：认证事件 */
     public static final String TARGET_AUTH = "auth";
+    /** 对象类型：分享链接 */
+    public static final String TARGET_SHARE = "share";
 
     private final AuditLogMapper auditLogMapper;
     private final ClientIpResolver clientIpResolver;

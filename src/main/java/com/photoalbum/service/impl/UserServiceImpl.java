@@ -38,6 +38,7 @@ public class UserServiceImpl implements UserService {
     private final PhotoMapper photoMapper;
     private final PhotoCollectionMapper collectionMapper;
     private final CategoryMapper categoryMapper;
+    private final com.photoalbum.mapper.TagMapper tagMapper;
     private final CollectionMemberMapper memberMapper;
     private final ShareLinkMapper shareLinkMapper;
     private final AuditService auditService;
@@ -46,7 +47,8 @@ public class UserServiceImpl implements UserService {
 
     public UserServiceImpl(UserMapper userMapper, AuthTupleMapper tupleMapper,
                            PhotoMapper photoMapper, PhotoCollectionMapper collectionMapper,
-                           CategoryMapper categoryMapper, CollectionMemberMapper memberMapper,
+                           CategoryMapper categoryMapper, com.photoalbum.mapper.TagMapper tagMapper,
+                           CollectionMemberMapper memberMapper,
                            ShareLinkMapper shareLinkMapper,
                            AuditService auditService, AccessPolicy accessPolicy,
                            @Lazy PasswordEncoder passwordEncoder) {
@@ -55,6 +57,7 @@ public class UserServiceImpl implements UserService {
         this.photoMapper = photoMapper;
         this.collectionMapper = collectionMapper;
         this.categoryMapper = categoryMapper;
+        this.tagMapper = tagMapper;
         this.memberMapper = memberMapper;
         this.shareLinkMapper = shareLinkMapper;
         this.auditService = auditService;
@@ -85,6 +88,7 @@ public class UserServiceImpl implements UserService {
         if (!StringUtils.hasText(dto.getUsername()) || !StringUtils.hasText(dto.getPassword())) {
             throw new BusinessException(400, "用户名与口令不能为空");
         }
+        requireStrongPassword(dto.getPassword(), dto.getUsername());
         if (findByUsername(dto.getUsername()) != null) {
             throw new BusinessException(400, "用户名已存在");
         }
@@ -140,6 +144,7 @@ public class UserServiceImpl implements UserService {
         }
         boolean passwordReset = StringUtils.hasText(dto.getPassword());
         if (passwordReset) {
+            requireStrongPassword(dto.getPassword(), user.getUsername());
             changes.add("重置口令（同时吊销其已签发令牌）");
         }
 
@@ -255,6 +260,27 @@ public class UserServiceImpl implements UserService {
         return value != null && value == 1 ? 1 : 0;
     }
 
+    /**
+     * 口令强度校验
+     *
+     * 登录侧已经有限流，但"123456"这类口令在自助改密或后台建号时仍然能写进去，
+     * 等于把限流的意义打掉一半。这里只做最低限度的可执行约束，不引入复杂度评分。
+     */
+    private void requireStrongPassword(String password, String username) {
+        if (!StringUtils.hasText(password)) {
+            return; // 更新时为空表示不修改口令
+        }
+        if (password.length() < 8) {
+            throw new BusinessException(400, "口令至少 8 位");
+        }
+        if (password.chars().allMatch(Character::isDigit)) {
+            throw new BusinessException(400, "口令不能为纯数字，请混合字母或符号");
+        }
+        if (StringUtils.hasText(username) && password.equalsIgnoreCase(username.trim())) {
+            throw new BusinessException(400, "口令不能与用户名相同");
+        }
+    }
+
     private long countAdmins() {
         return userMapper.selectCount(new LambdaQueryWrapper<User>().eq(User::getRole, UserRoles.ADMIN));
     }
@@ -329,16 +355,20 @@ public class UserServiceImpl implements UserService {
 
     @Override
     @Transactional
-    public void removePermission(Long permId) {
+    public void removePermission(Long userId, Long permId) {
         // 先取出被删除的条目内容，保证审计可追溯
-        AuthTuple tuple = tupleMapper.selectById(permId);
-        tupleMapper.deleteById(permId);
-        if (tuple != null) {
-            auditService.record(AuditService.ACTION_GRANT_REMOVE, AuditService.TARGET_PERMISSION, permId,
-                    String.format("移除账号 %s 的授权：%s", describeUser(tuple.getSubjectId()),
-                            describePerm(AuthTuple.RELATION_ALLOW.equals(tuple.getRelation()) ? "W" : "B",
-                                    tuple.getObjectType(), tuple.getObjectId())));
+        AuthTuple tuple = permId == null ? null : tupleMapper.selectById(permId);
+        // 归属校验：条目必须属于路径上的账号。此前只按 permId 删除，路径里的
+        // {id} 被完全忽略，越权删除他人授权条目时审计记录还会挂到别人名下。
+        if (tuple == null || !"user".equals(tuple.getSubjectType())
+                || userId == null || !userId.equals(tuple.getSubjectId())) {
+            throw new BusinessException(404, "授权条目不存在");
         }
+        tupleMapper.deleteById(permId);
+        auditService.record(AuditService.ACTION_GRANT_REMOVE, AuditService.TARGET_PERMISSION, permId,
+                String.format("移除账号 %s 的授权：%s", describeUser(tuple.getSubjectId()),
+                        describePerm(AuthTuple.RELATION_ALLOW.equals(tuple.getRelation()) ? "W" : "B",
+                                tuple.getObjectType(), tuple.getObjectId())));
     }
 
     /** 授权对象是否存在（按维度校验，避免对不存在的对象授权） */
@@ -347,6 +377,9 @@ public class UserServiceImpl implements UserService {
             case PermissionConstants.TARGET_PHOTO -> photoMapper.selectById(targetId) != null;
             case PermissionConstants.TARGET_COLLECTION -> collectionMapper.selectById(targetId) != null;
             case PermissionConstants.TARGET_CATEGORY -> categoryMapper.selectById(targetId) != null;
+            // 标签级授权：此前缺失该分支，导致后台可以选"标签"但接口一律返回 404，
+            // 界面上看起来支持、实际从未生效
+            case PermissionConstants.TARGET_TAG -> tagMapper.selectById(targetId) != null;
             default -> false;
         };
     }
@@ -361,6 +394,7 @@ public class UserServiceImpl implements UserService {
             case PermissionConstants.TARGET_PHOTO -> "照片";
             case PermissionConstants.TARGET_COLLECTION -> "合集";
             case PermissionConstants.TARGET_CATEGORY -> "分类";
+            case PermissionConstants.TARGET_TAG -> "标签";
             default -> targetType;
         };
         return typeLabel + "（" + targetLabel + " #" + targetId + "）";
