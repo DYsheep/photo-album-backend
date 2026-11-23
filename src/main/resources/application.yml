@@ -101,6 +101,13 @@ app:
     # 可用环境变量 TRUST_PROXY=false 覆盖——此前该值写死为 true，直连部署（如只开 8080）
     # 时攻击者每个请求换一个伪造 XFF 即可绕过来源维度限流。
     trust-proxy: ${TRUST_PROXY:true}
+  # 逆地理编码（年度小结里的地点统计）
+  # 需要腾讯位置服务的 key；未配置时地点统计自动降级，不影响其它统计。
+  # 申请地址：https://lbs.qq.com/dev/console/application/mine
+  geo:
+    key: ${TENCENT_MAP_KEY:}
+    endpoint: https://apis.map.qq.com/ws/geocoder/v1/
+    timeout-ms: 2500
 
 # 日志级别
 logging:

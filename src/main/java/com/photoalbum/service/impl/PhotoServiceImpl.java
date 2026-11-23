@@ -26,6 +26,7 @@ import com.photoalbum.security.AccessPolicy;
 import com.photoalbum.security.CurrentUserSupport;
 import com.photoalbum.service.PhotoService;
 import com.photoalbum.service.PhotoUrlResolver;
+import com.photoalbum.service.GeocodingService;
 import com.photoalbum.service.TagService;
 import com.qcloud.cos.COSClient;
 import com.qcloud.cos.model.ObjectMetadata;
@@ -83,6 +84,7 @@ public class PhotoServiceImpl extends ServiceImpl<PhotoMapper, Photo> implements
     private final AccessPolicy accessPolicy;
     private final PhotoUrlResolver photoUrlResolver;
     private final TagService tagService;
+    private final GeocodingService geocodingService;
     private final COSClient cosClient;
     private final ObjectMapper objectMapper = new ObjectMapper();
 
@@ -662,7 +664,7 @@ public class PhotoServiceImpl extends ServiceImpl<PhotoMapper, Photo> implements
         LambdaQueryWrapper<Photo> wp = new LambdaQueryWrapper<>();
         accessPolicy.applyPhotoFilter(wp, getCurrentUser());
         wp.select(Photo::getDateTaken, Photo::getCameraModel, Photo::getFocalLength,
-                Photo::getIso, Photo::getTitle);
+                Photo::getIso, Photo::getTitle, Photo::getGpsLatitude, Photo::getGpsLongitude);
         wp.isNotNull(Photo::getDateTaken).ne(Photo::getDateTaken, "");
 
         List<Photo> photos = photoMapper.selectList(wp);
@@ -747,8 +749,63 @@ public class PhotoServiceImpl extends ServiceImpl<PhotoMapper, Photo> implements
                 .collect(Collectors.toList());
         data.put("focalTop", focalTop);
 
+        // ---- 地点统计（GPS → 地名，结果按坐标缓存）----
+        // 单个请求内最多做 MAX_GEO_LOOKUPS 次实时解析，避免首次生成海报时
+        // 因为一次性调用太多地图接口而超时；其余会在后续请求中逐步补齐。
+        Map<String, String> regionByCoord = new HashMap<>();
+        Map<String, Long> placeCounts = new LinkedHashMap<>();
+        int liveLookups = 0;
+        int gpsPhotos = 0;
+
+        for (Photo p : yearPhotos) {
+            if (p.getGpsLatitude() == null || p.getGpsLongitude() == null) continue;
+            String coordKey = geocodingService.coordKey(p.getGpsLatitude(), p.getGpsLongitude());
+            if (coordKey == null) continue;
+            gpsPhotos++;
+
+            String region;
+            if (regionByCoord.containsKey(coordKey)) {
+                region = regionByCoord.get(coordKey);
+            } else {
+                region = null;
+                if (geocodingService.enabled() && liveLookups < MAX_GEO_LOOKUPS_PER_REQUEST) {
+                    region = geocodingService.resolveRegion(p.getGpsLatitude(), p.getGpsLongitude());
+                    liveLookups++;
+                }
+                regionByCoord.put(coordKey, region);
+            }
+
+            String label = (region == null || region.isBlank()) ? UNKNOWN_PLACE : region;
+            placeCounts.merge(label, 1L, Long::sum);
+        }
+
+        data.put("geoEnabled", geocodingService.enabled());
+        data.put("gpsPhotoCount", gpsPhotos);
+
+        List<Map<String, Object>> placeList = placeCounts.entrySet().stream()
+                .sorted(Map.Entry.<String, Long>comparingByValue().reversed())
+                .map(e -> {
+                    Map<String, Object> m = new LinkedHashMap<>();
+                    m.put("name", e.getKey());
+                    m.put("count", e.getValue());
+                    return m;
+                })
+                .collect(Collectors.toList());
+
+        // "去过几个地方"只统计有名字的地点，未识别的不算
+        long namedPlaces = placeList.stream()
+                .filter(m -> !UNKNOWN_PLACE.equals(m.get("name")))
+                .count();
+        data.put("placeCount", namedPlaces);
+        data.put("places", placeList.stream().limit(5).collect(Collectors.toList()));
+        data.put("topPlace", placeList.isEmpty() ? null : placeList.get(0));
+
         return data;
     }
+
+    /** 单次请求内最多实时解析多少个坐标（其余留给后续请求，靠缓存逐步补齐） */
+    private static final int MAX_GEO_LOOKUPS_PER_REQUEST = 20;
+    private static final String UNKNOWN_PLACE = "未识别地点";
 
     /** "2026:03:14 05:12:00" / "2026-03-14" → 2026 */
     private Integer parseTakenYear(String dateTaken) {
