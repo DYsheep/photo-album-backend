@@ -41,6 +41,14 @@ public interface PhotoService extends IService<Photo> {
     Map<String, Object> getDashboardStats();
 
     /**
+     * 按年聚合的拍摄小结（用于生成年度海报）
+     *
+     * @param year 目标年份；为空时取有照片的最新一年
+     * @return 照片数、拍摄天数、最早/最晚拍摄时刻、最常用设备与焦段、月度分布等
+     */
+    Map<String, Object> getYearlyStats(Integer year);
+
+    /**
      * 获取标签列表（含引用计数）
      * 从所有 photos 的 tags 字段中拆分、去重、计数，按 count 降序排列
      */

@@ -651,6 +651,181 @@ public class PhotoServiceImpl extends ServiceImpl<PhotoMapper, Photo> implements
     }
 
     /**
+     * 按年聚合的拍摄小结（年度海报数据源）
+     *
+     * 只读取参与统计的 5 个列；解析放在内存里做，因为 date_taken 是
+     * EXIF 原样字符串（"2026:03:14 05:12:00" / "2026-03-14"），
+     * 用 SQL 函数解析会和其它格式打架。个人站点的照片量级完全可以承受。
+     */
+    @Override
+    public Map<String, Object> getYearlyStats(Integer year) {
+        LambdaQueryWrapper<Photo> wp = new LambdaQueryWrapper<>();
+        accessPolicy.applyPhotoFilter(wp, getCurrentUser());
+        wp.select(Photo::getDateTaken, Photo::getCameraModel, Photo::getFocalLength,
+                Photo::getIso, Photo::getTitle);
+        wp.isNotNull(Photo::getDateTaken).ne(Photo::getDateTaken, "");
+
+        List<Photo> photos = photoMapper.selectList(wp);
+
+        // 先按年份分组，同时得到可用年份列表
+        Map<Integer, List<Photo>> byYear = new TreeMap<>(Comparator.reverseOrder());
+        for (Photo p : photos) {
+            Integer y = parseTakenYear(p.getDateTaken());
+            if (y != null) {
+                byYear.computeIfAbsent(y, k -> new ArrayList<>()).add(p);
+            }
+        }
+
+        List<Integer> availableYears = new ArrayList<>(byYear.keySet());
+        Integer targetYear = year;
+        if (targetYear == null || !byYear.containsKey(targetYear)) {
+            targetYear = availableYears.isEmpty() ? null : availableYears.get(0);
+        }
+
+        Map<String, Object> data = new HashMap<>();
+        data.put("availableYears", availableYears);
+        data.put("year", targetYear);
+
+        if (targetYear == null) {
+            data.put("photoCount", 0);
+            return data;
+        }
+
+        List<Photo> yearPhotos = byYear.getOrDefault(targetYear, List.of());
+        data.put("photoCount", yearPhotos.size());
+
+        // 拍摄天数 + 月度分布
+        Set<String> days = new HashSet<>();
+        int[] months = new int[12];
+        for (Photo p : yearPhotos) {
+            String day = parseTakenDay(p.getDateTaken());
+            if (day != null) {
+                days.add(day);
+                int month = parseMonth(day);
+                if (month >= 1 && month <= 12) months[month - 1]++;
+            }
+        }
+        data.put("shootingDays", days.size());
+        data.put("months", months);
+
+        // 最早 / 最晚拍摄时刻（只统计带时分秒的记录）
+        Photo earliest = null;
+        Photo latest = null;
+        String earliestTime = null;
+        String latestTime = null;
+        for (Photo p : yearPhotos) {
+            String time = parseTakenTime(p.getDateTaken());
+            if (time == null) continue;
+            if (earliestTime == null || time.compareTo(earliestTime) < 0) {
+                earliestTime = time;
+                earliest = p;
+            }
+            if (latestTime == null || time.compareTo(latestTime) > 0) {
+                latestTime = time;
+                latest = p;
+            }
+        }
+        data.put("earliest", timePoint(earliest, earliestTime));
+        data.put("latest", timePoint(latest, latestTime));
+
+        // 最常用设备 / 焦段 / ISO
+        data.put("topCamera", topOf(yearPhotos, Photo::getCameraModel, true));
+        data.put("topFocalLength", topOf(yearPhotos, Photo::getFocalLength, false));
+        data.put("topIso", topOf(yearPhotos, Photo::getIso, false));
+
+        // 焦段前三（海报上的环形图用）
+        Map<String, Long> focalCounts = countOf(yearPhotos, Photo::getFocalLength, false);
+        List<Map<String, Object>> focalTop = focalCounts.entrySet().stream()
+                .sorted(Map.Entry.<String, Long>comparingByValue().reversed())
+                .limit(3)
+                .map(e -> {
+                    Map<String, Object> m = new LinkedHashMap<>();
+                    m.put("name", e.getKey());
+                    m.put("count", e.getValue());
+                    return m;
+                })
+                .collect(Collectors.toList());
+        data.put("focalTop", focalTop);
+
+        return data;
+    }
+
+    /** "2026:03:14 05:12:00" / "2026-03-14" → 2026 */
+    private Integer parseTakenYear(String dateTaken) {
+        String day = parseTakenDay(dateTaken);
+        if (day == null || day.length() < 4) return null;
+        try {
+            return Integer.parseInt(day.substring(0, 4));
+        } catch (NumberFormatException e) {
+            return null;
+        }
+    }
+
+    /** 统一成 "2026-03-14"；无法解析返回 null */
+    private String parseTakenDay(String dateTaken) {
+        if (dateTaken == null || dateTaken.isBlank()) return null;
+        String datePart = dateTaken.trim().split("\\s+")[0].replace(':', '-');
+        // 至少要有 yyyy-MM-dd
+        if (!datePart.matches("\\d{4}-\\d{2}-\\d{2}")) return null;
+        return datePart;
+    }
+
+    /** "2026:03:14 05:12:00" → "05:12"；只有日期时返回 null */
+    private String parseTakenTime(String dateTaken) {
+        if (dateTaken == null || dateTaken.isBlank()) return null;
+        String[] parts = dateTaken.trim().split("\\s+");
+        if (parts.length < 2 || !parts[1].matches("\\d{2}:\\d{2}(:\\d{2})?")) return null;
+        return parts[1].substring(0, 5);
+    }
+
+    private int parseMonth(String day) {
+        try {
+            return Integer.parseInt(day.substring(5, 7));
+        } catch (Exception e) {
+            return -1;
+        }
+    }
+
+    /** 单个时刻的展示结构（为空时返回 null，前端据此决定是否展示这一块） */
+    private Map<String, Object> timePoint(Photo photo, String time) {
+        if (photo == null || time == null) return null;
+        Map<String, Object> m = new LinkedHashMap<>();
+        m.put("time", time);
+        m.put("date", parseTakenDay(photo.getDateTaken()));
+        m.put("title", photo.getTitle() == null ? "" : photo.getTitle());
+        return m;
+    }
+
+    /** 统计出现次数最多的取值 */
+    private Map<String, Object> topOf(List<Photo> photos,
+                                      java.util.function.Function<Photo, String> getter,
+                                      boolean upperCase) {
+        return countOf(photos, getter, upperCase).entrySet().stream()
+                .max(Map.Entry.comparingByValue())
+                .map(e -> {
+                    Map<String, Object> m = new LinkedHashMap<>();
+                    m.put("name", e.getKey());
+                    m.put("count", e.getValue());
+                    return m;
+                })
+                .orElse(null);
+    }
+
+    private Map<String, Long> countOf(List<Photo> photos,
+                                      java.util.function.Function<Photo, String> getter,
+                                      boolean upperCase) {
+        Map<String, Long> counts = new LinkedHashMap<>();
+        for (Photo p : photos) {
+            String value = getter.apply(p);
+            if (value == null || value.isBlank()) continue;
+            String key = value.trim().replaceAll("\\s+", " ");
+            if (upperCase) key = key.toUpperCase();
+            counts.merge(key, 1L, Long::sum);
+        }
+        return counts;
+    }
+
+    /**
      * 获取标签列表（含引用计数）
      */
     @Override

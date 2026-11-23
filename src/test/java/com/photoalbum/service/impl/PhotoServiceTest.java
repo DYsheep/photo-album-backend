@@ -1142,4 +1142,88 @@ class PhotoServiceTest {
         photo.setUpdatedAt(LocalDateTime.now());
         return photo;
     }
+
+    // ============================================================
+    // getYearlyStats() - 年度拍摄小结（海报数据）
+    // ============================================================
+
+    @Nested
+    @DisplayName("getYearlyStats() - 年度小结聚合")
+    class YearlyStatsTests {
+
+        private Photo taken(String dateTaken, String camera, String focal, String iso) {
+            Photo p = new Photo();
+            p.setDateTaken(dateTaken);
+            p.setCameraModel(camera);
+            p.setFocalLength(focal);
+            p.setIso(iso);
+            p.setTitle("作品");
+            return p;
+        }
+
+        @Test
+        @DisplayName("按年统计张数、天数、最早/最晚时刻与最常用设备焦段")
+        void shouldAggregateYear() {
+            List<Photo> all = List.of(
+                    taken("2026:03:14 05:12:00", "Canon EOS R5", "50mm", "200"),
+                    taken("2026:03:14 18:40:00", "Canon EOS R5", "50mm", "400"),
+                    taken("2026:07:02 23:47:00", "SONY A7M4", "85mm", "800"),
+                    taken("2025:12:31 23:59:00", "Canon EOS R5", "24mm", "100"),
+                    taken("2026-08-01", "Canon EOS R5", "50mm", "200") // 只有日期，不参与时刻统计
+            );
+            when(photoMapper.selectList(any(LambdaQueryWrapper.class))).thenReturn(all);
+
+            Map<String, Object> stats = photoService.getYearlyStats(2026);
+
+            assertEquals(2026, stats.get("year"));
+            assertEquals(List.of(2026, 2025), stats.get("availableYears"));
+            assertEquals(4, stats.get("photoCount"));   // 2026 年 4 张（含只有日期的那张）
+            assertEquals(3, stats.get("shootingDays")); // 03-14、07-02、08-01
+
+            @SuppressWarnings("unchecked")
+            Map<String, Object> earliest = (Map<String, Object>) stats.get("earliest");
+            @SuppressWarnings("unchecked")
+            Map<String, Object> latest = (Map<String, Object>) stats.get("latest");
+            assertEquals("05:12", earliest.get("time"));
+            assertEquals("23:47", latest.get("time"));
+
+            @SuppressWarnings("unchecked")
+            Map<String, Object> camera = (Map<String, Object>) stats.get("topCamera");
+            @SuppressWarnings("unchecked")
+            Map<String, Object> focal = (Map<String, Object>) stats.get("topFocalLength");
+            assertEquals("CANON EOS R5", camera.get("name"));
+            assertEquals(3L, camera.get("count"));
+            assertEquals("50mm", focal.get("name"));
+            assertEquals(3L, focal.get("count"));
+
+            @SuppressWarnings("unchecked")
+            List<Map<String, Object>> focalTop = (List<Map<String, Object>>) stats.get("focalTop");
+            assertEquals("50mm", focalTop.get(0).get("name"));
+        }
+
+        @Test
+        @DisplayName("未指定年份时取最近有照片的一年")
+        void shouldDefaultToLatestYear() {
+            when(photoMapper.selectList(any(LambdaQueryWrapper.class))).thenReturn(List.of(
+                    taken("2024:05:01 10:00:00", "A", "24mm", "100"),
+                    taken("2025:06:01 10:00:00", "B", "35mm", "200")
+            ));
+
+            Map<String, Object> stats = photoService.getYearlyStats(null);
+
+            assertEquals(2025, stats.get("year"));
+            assertEquals(1, stats.get("photoCount"));
+        }
+
+        @Test
+        @DisplayName("没有带拍摄时间的照片时返回空结构而不报错")
+        void shouldHandleEmptyData() {
+            when(photoMapper.selectList(any(LambdaQueryWrapper.class))).thenReturn(List.of());
+
+            Map<String, Object> stats = photoService.getYearlyStats(2026);
+
+            assertNull(stats.get("year"));
+            assertEquals(0, stats.get("photoCount"));
+        }
+    }
 }

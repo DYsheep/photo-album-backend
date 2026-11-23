@@ -178,6 +178,19 @@ public class PhotoController {
     }
 
     /**
+     * 按年聚合的拍摄小结（年度海报数据源）
+     * GET /api/photos/stats/yearly?year=2026
+     *
+     * 与 /stats 一致，仅登录用户可读——里面同样包含设备、焦段等运营信息。
+     */
+    @GetMapping("/stats/yearly")
+    @PreAuthorize("isAuthenticated()")
+    public Result<Map<String, Object>> yearlyStats(
+            @RequestParam(value = "year", required = false) Integer year) {
+        return Result.ok(photoService.getYearlyStats(year));
+    }
+
+    /**
      * 获取所有有 GPS 坐标的照片
      * GET /api/photos/gps
      */
