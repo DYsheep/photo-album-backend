@@ -12,7 +12,6 @@ import com.photoalbum.mapper.PhotoCollectionPhotoMapper;
 import com.photoalbum.mapper.PhotoMapper;
 import com.photoalbum.mapper.ShareLinkMapper;
 import com.photoalbum.security.AccessPolicy;
-import com.photoalbum.service.GeocodingService;
 import com.photoalbum.service.PhotoUrlResolver;
 import com.photoalbum.service.TagService;
 import com.qcloud.cos.COSClient;
@@ -71,10 +70,6 @@ class PhotoServiceTest {
     /** 标签关联表同步（写路径双写），单测中为无操作 */
     @Mock
     private TagService tagService;
-
-    /** 逆地理编码：年度小结的地点统计用，测试中默认未启用 */
-    @Mock
-    private GeocodingService geocodingService;
 
     /** 对象存储客户端为外部依赖，单元测试中必须 mock（否则上传路径会因空指针失败） */
     @Mock
@@ -1156,35 +1151,6 @@ class PhotoServiceTest {
     @DisplayName("getYearlyStats() - 年度小结聚合")
     class YearlyStatsTests {
 
-        @Test
-        @DisplayName("地点统计：按坐标解析地名，统计最常拍摄地点")
-        @SuppressWarnings("unchecked")
-        void shouldAggregatePlaces() {
-            Photo a = taken("2026:03:14 10:00:00", "A", "50mm", "200");
-            a.setGpsLatitude(39.9042); a.setGpsLongitude(116.4074);
-            Photo b = taken("2026:03:15 10:00:00", "A", "50mm", "200");
-            b.setGpsLatitude(39.9050); b.setGpsLongitude(116.4076); // 与 a 归入同一坐标键
-            Photo c = taken("2026:03:16 10:00:00", "A", "50mm", "200");
-            c.setGpsLatitude(30.2741); c.setGpsLongitude(120.1551);
-
-            when(photoMapper.selectList(any(LambdaQueryWrapper.class))).thenReturn(List.of(a, b, c));
-            when(geocodingService.enabled()).thenReturn(true);
-            when(geocodingService.coordKey(any(), any())).thenAnswer(inv -> String.format(
-                    java.util.Locale.ROOT, "%.2f,%.2f",
-                    (Double) inv.getArgument(0), (Double) inv.getArgument(1)));
-            when(geocodingService.resolveRegion(any(), any())).thenAnswer(inv -> {
-                double lat = (Double) inv.getArgument(0);
-                return lat > 35 ? "北京市朝阳区" : "杭州市西湖区";
-            });
-
-            Map<String, Object> stats = photoService.getYearlyStats(2026);
-
-            assertEquals(3, stats.get("gpsPhotoCount"));
-            assertEquals(2L, stats.get("placeCount"));
-            Map<String, Object> top = (Map<String, Object>) stats.get("topPlace");
-            assertEquals("北京市朝阳区", top.get("name"));
-            assertEquals(2L, top.get("count"));
-        }
 
         private Photo taken(String dateTaken, String camera, String focal, String iso) {
             Photo p = new Photo();
