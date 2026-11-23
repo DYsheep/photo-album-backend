@@ -56,10 +56,32 @@ public class GlobalExceptionHandler {
 
     /**
      * 业务异常（自定义 BusinessException）
+     *
+     * 这里包含大量"被拒绝的写操作"：上传格式不符、文件超大、触发限流等。
+     * 此前只返回、不落日志，导致事后无法回答"这一批为什么失败、失败了多少"。
+     * 写操作记 WARN（量小且值得追），读路径压到 DEBUG（404 很常见，避免刷日志）。
      */
     @ExceptionHandler(BusinessException.class)
-    public Result<Void> handleBusiness(BusinessException e) {
+    public Result<Void> handleBusiness(BusinessException e,
+                                       jakarta.servlet.http.HttpServletRequest request) {
+        String method = request == null ? "" : request.getMethod();
+        String uri = request == null ? "" : request.getRequestURI();
+        boolean writeOperation = "POST".equals(method) || "PUT".equals(method)
+                || "DELETE".equals(method) || "PATCH".equals(method);
+        if (writeOperation) {
+            log.warn("业务异常 {} {} -> {}: {}（账号：{}）", method, uri, e.getCode(), e.getMessage(),
+                    currentUsername());
+        } else {
+            log.debug("业务异常 {} {} -> {}: {}", method, uri, e.getCode(), e.getMessage());
+        }
         return Result.fail(e.getCode(), e.getMessage());
+    }
+
+    /** 当前账号（未登录为 anonymous），仅用于日志 */
+    private String currentUsername() {
+        com.photoalbum.entity.User user =
+                com.photoalbum.security.CurrentUserSupport.getCurrentUser();
+        return user != null && user.getUsername() != null ? user.getUsername() : "anonymous";
     }
 
     /**

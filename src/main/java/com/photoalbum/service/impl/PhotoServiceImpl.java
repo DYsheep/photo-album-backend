@@ -768,13 +768,18 @@ public class PhotoServiceImpl extends ServiceImpl<PhotoMapper, Photo> implements
         }
 
         String originalName = file.getOriginalFilename();
+        long size = file.getSize();
         String ext = getFileExtension(originalName);
         if (!EXT_CONTENT_TYPE.containsKey(ext)) {
+            // 记录被拒绝的文件名与扩展名：批量上传失败时靠这一行才能判断
+            // 是"格式不支持（如 iPhone 的 HEIC、相机 RAW）"还是别的原因
+            log.warn("上传被拒绝（格式不支持）: file={}, ext={}, size={}B", originalName, ext, size);
             throw new BusinessException("仅支持 JPG/PNG/WEBP/GIF/BMP 格式");
         }
 
         long maxBytes = (long) maxSizeMb * 1024 * 1024;
-        if (file.getSize() > maxBytes) {
+        if (size > maxBytes) {
+            log.warn("上传被拒绝（超出大小上限）: file={}, size={}B, limit={}MB", originalName, size, maxSizeMb);
             throw new BusinessException("文件大小不能超过 " + maxSizeMb + "MB");
         }
 
@@ -783,10 +788,11 @@ public class PhotoServiceImpl extends ServiceImpl<PhotoMapper, Photo> implements
         try (java.io.InputStream in = file.getInputStream()) {
             read = in.readNBytes(head, 0, head.length);
         } catch (IOException e) {
-            log.warn("上传文件读取失败: {}", e.getMessage());
+            log.warn("上传文件读取失败: file={}, size={}B, err={}", originalName, size, e.getMessage());
             throw new BusinessException("文件读取失败，请重试");
         }
         if (!matchesImageSignature(head, read)) {
+            log.warn("上传被拒绝（内容不是有效图片）: file={}, size={}B", originalName, size);
             throw new BusinessException("文件内容不是有效的图片");
         }
     }
