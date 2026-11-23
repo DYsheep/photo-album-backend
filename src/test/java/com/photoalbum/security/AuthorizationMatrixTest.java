@@ -100,6 +100,47 @@ class AuthorizationMatrixTest {
     }
 
     // ============================================================
+    // 未登录响应的状态码契约
+    // ============================================================
+
+    /**
+     * 未登录访问受保护接口必须返回 401，而不是 403
+     *
+     * 背景：Spring Security 默认用 Http403ForbiddenEntryPoint，未登录也返回 403，
+     * 前端无法区分"会话过期"与"权限不足"。历史上表现为：令牌过期后上传全部失败，
+     * 页面却仍显示已登录，用户只能看到 "Request failed with status code 403"。
+     */
+    @Test
+    @DisplayName("未登录访问受保护接口返回 401 + 业务码 401")
+    void shouldReturn401WhenNotAuthenticated() throws Exception {
+        for (String path : new String[]{"/api/photos/stats", "/api/admin/users", "/api/admin/audit-logs"}) {
+            MvcResult result = mockMvc.perform(MockMvcRequestBuilders.get(path)).andReturn();
+            int status = result.getResponse().getStatus();
+            assertThat(status)
+                    .as("未登录访问 %s 应返回 401", path)
+                    .isEqualTo(401);
+            Result<?> parsed = objectMapper.readValue(result.getResponse().getContentAsString(), Result.class);
+            assertThat(parsed.getCode()).as("%s 的业务码", path).isEqualTo(401);
+        }
+    }
+
+    /**
+     * 已登录但权限不足仍返回 403（不能因为上一条改动把权限不足也变成 401）
+     */
+    @Test
+    @DisplayName("已登录但缺少权限时仍为 403")
+    void shouldReturn403WhenAuthenticatedButForbidden() throws Exception {
+        String token = tokenFor(USER);
+        MvcResult result = mockMvc.perform(MockMvcRequestBuilders.get("/api/admin/users")
+                .header("Authorization", "Bearer " + token)).andReturn();
+
+        assertThat(isDenied(result)).as("普通用户访问用户管理应被拒绝").isTrue();
+        assertThat(result.getResponse().getStatus())
+                .as("已登录用户不应得到 401（那会让前端误判为会话过期）")
+                .isNotEqualTo(401);
+    }
+
+    // ============================================================
     // 矩阵
     // ============================================================
 

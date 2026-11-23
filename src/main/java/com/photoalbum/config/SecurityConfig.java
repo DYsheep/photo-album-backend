@@ -1,6 +1,8 @@
 package com.photoalbum.config;
 
 import com.photoalbum.security.JwtAuthenticationFilter;
+import jakarta.servlet.http.HttpServletResponse;
+import java.io.IOException;
 import lombok.RequiredArgsConstructor;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
@@ -45,6 +47,10 @@ public class SecurityConfig {
                 .requestMatchers(HttpMethod.GET, "/files/**").permitAll()
                 // 放行：分享链接的公开访问（GET 查询 + 卡片封面；创建分享必须登录，见 ShareController）
                 .requestMatchers(HttpMethod.GET, "/api/share/**").permitAll()
+                // 后台仪表盘统计只给登录用户（M07）。
+                // 注意：必须排在下面的 /api/photos/* 通配之前，否则会被 permitAll 吞掉——
+                // 此前只有注释没有规则，实际仍对匿名开放（匿名可读照片数、存储用量、器材分布）。
+                .requestMatchers(HttpMethod.GET, "/api/photos/stats").authenticated()
                 // 放行：公开读取接口（照片列表、详情、分类列表、标签、合集、地图）
                 // 注意：/api/photos/stats 已从本清单移除（修复 M07）——它只被后台仪表盘调用，
                 // 匿名可读会泄露站点规模、存储用量、器材与年份分布等运营数据，现改为需登录。
@@ -78,10 +84,34 @@ public class SecurityConfig {
                 .anyRequest().denyAll()
             )
 
+            // 未登录 / 令牌过期 → 401，已登录但权限不足 → 403
+            // Spring Security 默认未登录也返回 403（Http403ForbiddenEntryPoint），
+            // 前端无法区分"会话过期"与"权限不足"：令牌过期的用户会一直看到
+            // "Request failed with status code 403"，页面看起来还处于登录状态。
+            .exceptionHandling(ex -> ex
+                .authenticationEntryPoint((request, response, authException) ->
+                        writeJsonError(response, 401, "未登录或登录已过期，请重新登录"))
+                .accessDeniedHandler((request, response, accessDeniedException) ->
+                        writeJsonError(response, 403, "无权限执行该操作"))
+            )
+
             // 注册 JWT 过滤器（在 UsernamePasswordFilter 之前）
             .addFilterBefore(jwtAuthenticationFilter, UsernamePasswordAuthenticationFilter.class);
 
         return http.build();
+    }
+
+    /**
+     * 以统一 Result 结构返回鉴权失败信息
+     *
+     * 消息为固定文案（不含用户输入），无需 JSON 转义。
+     */
+    private void writeJsonError(HttpServletResponse response, int status, String message) throws IOException {
+        response.setStatus(status);
+        response.setCharacterEncoding("UTF-8");
+        response.setContentType("application/json;charset=UTF-8");
+        response.getWriter().write(
+                "{\"code\":" + status + ",\"message\":\"" + message + "\",\"data\":null}");
     }
 
     /**
