@@ -120,10 +120,11 @@ class CollectionServiceCoverVisibilityTest {
 
             when(collectionMapper.selectList(any(LambdaQueryWrapper.class)))
                     .thenReturn(List.of(collection));
-            when(photoMapper.selectById(9L)).thenReturn(privateCover);
+            when(photoMapper.selectBatchIds(any())).thenReturn(List.of(privateCover));
             // 匿名调用者（当前用户为 null）看不到私密照片
             when(accessPolicy.canViewPhoto(isNull(), eq(privateCover))).thenReturn(false);
-            when(photoMapper.selectCount(any(LambdaQueryWrapper.class))).thenReturn(0L);
+            when(collectionPhotoMapper.countVisibleByCollections(any(), any()))
+                    .thenReturn(List.of(java.util.Map.of("collectionId", 5L, "cnt", 0L)));
             when(photoMapper.selectOne(any(LambdaQueryWrapper.class))).thenReturn(null);
 
             List<CollectionDTO> result = collectionService.getPublishedCollections();
@@ -144,9 +145,10 @@ class CollectionServiceCoverVisibilityTest {
 
             when(collectionMapper.selectList(any(LambdaQueryWrapper.class)))
                     .thenReturn(List.of(collection));
-            when(photoMapper.selectById(9L)).thenReturn(privateCover);
+            when(photoMapper.selectBatchIds(any())).thenReturn(List.of(privateCover));
             when(accessPolicy.canViewPhoto(isNull(), eq(privateCover))).thenReturn(false);
-            when(photoMapper.selectCount(any(LambdaQueryWrapper.class))).thenReturn(1L);
+            when(collectionPhotoMapper.countVisibleByCollections(any(), any()))
+                    .thenReturn(List.of(java.util.Map.of("collectionId", 5L, "cnt", 1L)));
             // 兜底查询自身已带可见性条件（applyPhotoFilter），返回的必然是一张可见照片
             when(photoMapper.selectOne(any(LambdaQueryWrapper.class))).thenReturn(visible);
 
@@ -166,7 +168,8 @@ class CollectionServiceCoverVisibilityTest {
 
             when(collectionMapper.selectList(any(LambdaQueryWrapper.class)))
                     .thenReturn(List.of(collection));
-            when(photoMapper.selectCount(any(LambdaQueryWrapper.class))).thenReturn(0L);
+            when(collectionPhotoMapper.countVisibleByCollections(any(), any()))
+                    .thenReturn(List.of(java.util.Map.of("collectionId", 5L, "cnt", 0L)));
             when(photoMapper.selectOne(any(LambdaQueryWrapper.class))).thenReturn(null);
 
             List<CollectionDTO> result = collectionService.getPublishedCollections();
@@ -174,7 +177,7 @@ class CollectionServiceCoverVisibilityTest {
             assertThat(result.get(0).getCoverUrl()).isNull();
             assertThat(result.get(0).getCoverPhotoId()).isNull();
             // 未配置封面时不应为取封面而按 ID 查询照片
-            verify(photoMapper, never()).selectById(any());
+            verify(photoMapper, never()).selectBatchIds(any());
             assertThat(privateOnly.getIsPrivate()).isEqualTo(1);
         }
     }
@@ -191,9 +194,10 @@ class CollectionServiceCoverVisibilityTest {
 
             when(collectionMapper.selectList(any(LambdaQueryWrapper.class)))
                     .thenReturn(List.of(collection));
-            when(photoMapper.selectById(9L)).thenReturn(cover);
+            when(photoMapper.selectBatchIds(any())).thenReturn(List.of(cover));
             when(accessPolicy.canViewPhoto(isNull(), eq(cover))).thenReturn(true);
-            when(photoMapper.selectCount(any(LambdaQueryWrapper.class))).thenReturn(1L);
+            when(collectionPhotoMapper.countVisibleByCollections(any(), any()))
+                    .thenReturn(List.of(java.util.Map.of("collectionId", 5L, "cnt", 1L)));
 
             List<CollectionDTO> result = collectionService.getPublishedCollections();
 
@@ -208,8 +212,9 @@ class CollectionServiceCoverVisibilityTest {
 
             when(collectionMapper.selectList(any(LambdaQueryWrapper.class)))
                     .thenReturn(List.of(collection));
-            when(photoMapper.selectById(999L)).thenReturn(null);
-            when(photoMapper.selectCount(any(LambdaQueryWrapper.class))).thenReturn(0L);
+            when(photoMapper.selectBatchIds(any())).thenReturn(List.of());
+            when(collectionPhotoMapper.countVisibleByCollections(any(), any()))
+                    .thenReturn(List.of(java.util.Map.of("collectionId", 5L, "cnt", 0L)));
             when(photoMapper.selectOne(any(LambdaQueryWrapper.class))).thenReturn(null);
 
             List<CollectionDTO> result = collectionService.getPublishedCollections();
@@ -230,7 +235,7 @@ class CollectionServiceCoverVisibilityTest {
                     .thenReturn(Collections.emptyList());
 
             assertThat(collectionService.getPublishedCollections()).isEmpty();
-            verify(photoMapper, never()).selectCount(any(LambdaQueryWrapper.class));
+            verify(collectionPhotoMapper, never()).countVisibleByCollections(any(), any());
         }
     }
 }

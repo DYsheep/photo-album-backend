@@ -478,15 +478,30 @@ public class AccessPolicy {
     }
 
     /**
-     * "对当前调用者可见的照片"SQL 条件（不含 WHERE）
+     * "对当前调用者可见的照片"SQL 条件（可直接内联进自定义查询）
      *
-     * 计数、统计、标签/分类聚合等派生数据统一复用它，避免口径不一致造成存在性泄露。
+     * 与 {@link #applyPhotoFilter} 同一套逻辑，区别是这里返回**字面量** SQL：
+     * 内联的只可能是数据库里的 Long 值与本类常量，不接受任何请求参数，因此不存在注入面。
+     * 用途：需要 JOIN/GROUP BY 的聚合查询（仪表盘求和、合集照片数批量统计），
+     * 这类查询没法直接使用 LambdaQueryWrapper 的条件树。
+     *
+     * 注意：条件里的列名不带表别名，使用方必须保证 `t_photo` 是子查询中的唯一来源表；
+     * 若主查询 JOIN 了 t_photo，请把它放进 `photo_id IN (SELECT id FROM t_photo WHERE …)` 子查询。
      */
-    public String visiblePhotoCondition(User user) {
-        LambdaQueryWrapper<Photo> wrapper = new LambdaQueryWrapper<>();
-        applyPhotoFilter(wrapper, user);
-        String segment = wrapper.getSqlSegment();
-        return (segment == null || segment.isBlank()) ? "1 = 1" : segment;
+    public String visiblePhotoSql(User user) {
+        PrivateScope scope = photoScope(user);
+        List<String> exclusions = exclusionSql(scope, user);
+        if (scope.all() && exclusions.isEmpty()) {
+            return "1 = 1";
+        }
+        String privateCondition = buildPrivateVisibleCondition(scope, user);
+        String condition = privateCondition == null
+                ? "is_private = 0"
+                : "(is_private = 0 OR (" + privateCondition + "))";
+        if (!exclusions.isEmpty()) {
+            condition += " AND " + String.join(" AND ", exclusions);
+        }
+        return condition;
     }
 
     // ========== 内部工具 ==========

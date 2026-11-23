@@ -141,8 +141,8 @@ class PhotoServiceTest {
             // 使用 ArgumentCaptor 捕获 insert 的 Photo 以验证结构化字段
             ArgumentCaptor<Photo> photoCaptor = ArgumentCaptor.forClass(Photo.class);
             when(photoMapper.insert(photoCaptor.capture())).thenReturn(1);
-            // mock getById 用于 toDTO 中的分类名称填充
-            when(categoryMapper.selectById(anyLong())).thenReturn(null);
+            // mock 批量查询用于 toDTO 中的分类名称填充（列表/单条都走批量预取）
+            when(categoryMapper.selectBatchIds(any())).thenReturn(List.of());
 
             // Act
             PhotoDTO result = photoService.upload(file, "测试照片", 1L, null, "描述", "风景,旅行", null);
@@ -323,13 +323,13 @@ class PhotoServiceTest {
             cat.setName("风景");
 
             when(photoMapper.insert(any(Photo.class))).thenReturn(1);
-            when(categoryMapper.selectById(1L)).thenReturn(cat);
+            when(categoryMapper.selectBatchIds(any())).thenReturn(List.of(cat));
 
             PhotoDTO result = photoService.upload(file, "风景照", 1L, null, null, null, null);
 
             assertNotNull(result);
             assertEquals("风景", result.getCategoryName());
-            verify(categoryMapper).selectById(1L);
+            verify(categoryMapper).selectBatchIds(any());
         }
     }
 
@@ -526,10 +526,13 @@ class PhotoServiceTest {
 
             when(photoMapper.selectCount(any())).thenReturn(3L);
             when(categoryMapper.selectCount(null)).thenReturn(2L);
+            // 浏览量/存储用量改为 SQL 聚合
+            when(accessPolicy.visiblePhotoSql(any())).thenReturn("1 = 1");
+            when(photoMapper.selectMaps(any())).thenReturn(List.of(Map.of("views", 150L, "bytes", 3072L)));
             when(photoMapper.selectList(any())).thenReturn(Arrays.asList(p1, p2, p3));
             when(photoMapper.selectList(any(LambdaQueryWrapper.class))).thenReturn(Arrays.asList(p1, p2, p3));
-            when(categoryMapper.selectById(1L)).thenReturn(cat1);
-            when(categoryMapper.selectById(2L)).thenReturn(cat2);
+            // 最近照片的分类名改为批量预取
+            when(categoryMapper.selectBatchIds(any())).thenReturn(List.of(cat1, cat2));
 
             // Act
             Map<String, Object> stats = photoService.getDashboardStats();
@@ -553,6 +556,8 @@ class PhotoServiceTest {
         void shouldReturnZeroStatsWhenEmpty() {
             when(photoMapper.selectCount(any())).thenReturn(0L);
             when(categoryMapper.selectCount(null)).thenReturn(0L);
+            when(accessPolicy.visiblePhotoSql(any())).thenReturn("1 = 1");
+            when(photoMapper.selectMaps(any())).thenReturn(Collections.emptyList());
             when(photoMapper.selectList(any())).thenReturn(Collections.emptyList());
             when(photoMapper.selectList(any(LambdaQueryWrapper.class))).thenReturn(Collections.emptyList());
 
@@ -600,7 +605,7 @@ class PhotoServiceTest {
             mockPage.setTotal(1);
 
             when(photoMapper.selectPage(any(Page.class), any(LambdaQueryWrapper.class))).thenReturn(mockPage);
-            when(categoryMapper.selectById(1L)).thenReturn(null);
+            when(categoryMapper.selectBatchIds(any())).thenReturn(List.of());
 
             @SuppressWarnings("unchecked")
             Map<String, Object> result = (Map<String, Object>) photoService.getPhotoPage(dto);
@@ -659,7 +664,7 @@ class PhotoServiceTest {
             mockPage.setTotal(1);
 
             when(photoMapper.selectPage(any(Page.class), any(LambdaQueryWrapper.class))).thenReturn(mockPage);
-            when(categoryMapper.selectById(5L)).thenReturn(null);
+            when(categoryMapper.selectBatchIds(any())).thenReturn(List.of());
 
             @SuppressWarnings("unchecked")
             Map<String, Object> result = (Map<String, Object>) photoService.getPhotoPage(dto);
@@ -912,9 +917,11 @@ class PhotoServiceTest {
 
             when(photoMapper.selectCount(any())).thenReturn(2L);
             when(categoryMapper.selectCount(isNull())).thenReturn(1L);
+            when(accessPolicy.visiblePhotoSql(any())).thenReturn("1 = 1");
+            when(photoMapper.selectMaps(any())).thenReturn(List.of(Map.of("views", 30L, "bytes", 3072L)));
             when(photoMapper.selectList(isNull())).thenReturn(Arrays.asList(p1, p2));
             when(photoMapper.selectList(any(LambdaQueryWrapper.class))).thenReturn(Arrays.asList(p1, p2));
-            when(categoryMapper.selectById(anyLong())).thenReturn(null);
+            when(categoryMapper.selectBatchIds(any())).thenReturn(List.of());
 
             // Act
             Map<String, Object> stats = photoService.getDashboardStats();
@@ -974,9 +981,11 @@ class PhotoServiceTest {
 
             when(photoMapper.selectCount(any())).thenReturn(1L);
             when(categoryMapper.selectCount(isNull())).thenReturn(1L);
+            when(accessPolicy.visiblePhotoSql(any())).thenReturn("1 = 1");
+            when(photoMapper.selectMaps(any())).thenReturn(List.of(Map.of("views", 5L, "bytes", 512L)));
             when(photoMapper.selectList(isNull())).thenReturn(Arrays.asList(photo));
             when(photoMapper.selectList(any(LambdaQueryWrapper.class))).thenReturn(Arrays.asList(photo));
-            when(categoryMapper.selectById(anyLong())).thenReturn(null);
+            when(categoryMapper.selectBatchIds(any())).thenReturn(List.of());
 
             // Act
             Map<String, Object> stats = photoService.getDashboardStats();

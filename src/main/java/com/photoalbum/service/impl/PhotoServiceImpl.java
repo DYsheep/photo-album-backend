@@ -123,6 +123,11 @@ public class PhotoServiceImpl extends ServiceImpl<PhotoMapper, Photo> implements
         return CurrentUserSupport.getCurrentUser();
     }
 
+    /** 聚合结果为 BigDecimal/Long，统一转 long（null 视为 0） */
+    private static long toLong(Object value) {
+        return value instanceof Number number ? number.longValue() : 0L;
+    }
+
     /** 可见范围内的照片查询条件（计数/统计/标签聚合统一复用，保证口径一致） */
     private LambdaQueryWrapper<Photo> visiblePhotoWrapper() {
         LambdaQueryWrapper<Photo> wrapper = new LambdaQueryWrapper<>();
@@ -163,8 +168,12 @@ public class PhotoServiceImpl extends ServiceImpl<PhotoMapper, Photo> implements
 
         Page<Photo> result = photoMapper.selectPage(page, wrapper);
 
-        // 转换为 DTO，填充分类名称
-        List<PhotoDTO> dtoList = result.getRecords().stream().map(this::toDTO).collect(Collectors.toList());
+        // 分类名批量预取：一页只查一次，而不是每行查一次
+        Map<Long, String> categoryNames = categoryNamesOf(
+                result.getRecords().stream().map(Photo::getCategoryId).collect(Collectors.toList()));
+        List<PhotoDTO> dtoList = result.getRecords().stream()
+                .map(photo -> toDTO(photo, categoryNames, false))
+                .collect(Collectors.toList());
 
         Map<String, Object> data = new HashMap<>();
         data.put("list", dtoList);
@@ -468,24 +477,30 @@ public class PhotoServiceImpl extends ServiceImpl<PhotoMapper, Photo> implements
         long totalCategories = categoryMapper.selectCount(null);
         data.put("totalCategories", totalCategories);
 
-        // 总浏览量
-        List<Photo> allPhotos = photoMapper.selectList(visiblePhotoWrapper());
-        int totalViews = allPhotos.stream()
-                .mapToInt(p -> p.getViewCount() != null ? p.getViewCount() : 0)
-                .sum();
-        data.put("totalViews", totalViews);
+        // 总浏览量 / 存储用量：用 SQL 聚合，不再把全部照片实体读进内存
+        // （此前 selectList 全表 + 内存 sum，每行还带着 exif_info 这类大字段）
+        Map<String, Object> sums = photoMapper.selectMaps(
+                        new com.baomidou.mybatisplus.core.conditions.query.QueryWrapper<Photo>()
+                                .select("COALESCE(SUM(view_count), 0) AS views",
+                                        "COALESCE(SUM(file_size), 0) AS bytes")
+                                .apply(accessPolicy.visiblePhotoSql(getCurrentUser())))
+                .stream().findFirst().orElse(Map.of());
+        data.put("totalViews", (int) toLong(sums.get("views")));
+        data.put("storageUsed", formatFileSize(toLong(sums.get("bytes"))));
 
-        // 存储用量
-        long totalBytes = allPhotos.stream()
-                .mapToLong(p -> p.getFileSize() != null ? p.getFileSize() : 0L)
-                .sum();
-        data.put("storageUsed", formatFileSize(totalBytes));
+        // EXIF 分布：需要逐行分组，但只取参与统计的 4 列（不再整行加载）
+        LambdaQueryWrapper<Photo> exifWp = new LambdaQueryWrapper<>();
+        accessPolicy.applyPhotoFilter(exifWp, getCurrentUser());
+        exifWp.select(Photo::getFocalLength, Photo::getCameraModel, Photo::getIso, Photo::getDateTaken);
+        List<Photo> allPhotos = photoMapper.selectList(exifWp);
 
         // 最近 5 张上传
         LambdaQueryWrapper<Photo> recentWp = new LambdaQueryWrapper<>();
         accessPolicy.applyPhotoFilter(recentWp, getCurrentUser());
         recentWp.orderByDesc(Photo::getCreatedAt).last("LIMIT 5");
         List<Photo> recentPhotos = photoMapper.selectList(recentWp);
+        Map<Long, String> recentCategoryNames = categoryNamesOf(
+                recentPhotos.stream().map(Photo::getCategoryId).collect(Collectors.toList()));
         List<Map<String, Object>> recentList = recentPhotos.stream().map(p -> {
             Map<String, Object> item = new HashMap<>();
             item.put("id", p.getId());
@@ -494,13 +509,8 @@ public class PhotoServiceImpl extends ServiceImpl<PhotoMapper, Photo> implements
             String thumb = photoUrlResolver.resolveThumbnail(p.getThumbnailUrl(), p.getIsPrivate());
             item.put("thumbnailUrl", (thumb != null && !thumb.isEmpty()) ? (thumb.startsWith("http") ? thumb : accessUrlPrefix + thumb) : null);
             item.put("createdAt", p.getCreatedAt() != null ? p.getCreatedAt().toString() : "");
-            // 填充分类名称
-            if (p.getCategoryId() != null) {
-                Category cat = categoryMapper.selectById(p.getCategoryId());
-                item.put("categoryName", cat != null ? cat.getName() : "");
-            } else {
-                item.put("categoryName", "");
-            }
+            item.put("categoryName", p.getCategoryId() == null
+                    ? "" : recentCategoryNames.getOrDefault(p.getCategoryId(), ""));
             return item;
         }).collect(Collectors.toList());
         data.put("recentPhotos", recentList);
@@ -555,6 +565,9 @@ public class PhotoServiceImpl extends ServiceImpl<PhotoMapper, Photo> implements
     public List<Map<String, Object>> getTagList() {
         LambdaQueryWrapper<Photo> wrapper = new LambdaQueryWrapper<>();
         accessPolicy.applyPhotoFilter(wrapper, getCurrentUser());
+        // 只取 tags 一列：此前 selectList 会把整行实体读出来（含 exif_info、描述、URL 等大字段），
+        // 而这里真正需要的只是逗号分隔的标签串
+        wrapper.select(Photo::getTags);
         List<Photo> allPhotos = photoMapper.selectList(wrapper);
         Map<String, Long> tagCountMap = new HashMap<>();
 
@@ -654,7 +667,11 @@ public class PhotoServiceImpl extends ServiceImpl<PhotoMapper, Photo> implements
         wrapper.orderByDesc(Photo::getCreatedAt);
 
         List<Photo> photos = photoMapper.selectList(wrapper);
-        return photos.stream().map(this::toDTO).collect(Collectors.toList());
+        Map<Long, String> categoryNames = categoryNamesOf(
+                photos.stream().map(Photo::getCategoryId).collect(Collectors.toList()));
+        return photos.stream()
+                .map(photo -> toDTO(photo, categoryNames, false))
+                .collect(Collectors.toList());
     }
 
     @Override
@@ -1032,6 +1049,32 @@ public class PhotoServiceImpl extends ServiceImpl<PhotoMapper, Photo> implements
      * Entity -> DTO 转换，补充分类名称和完整访问URL
      */
     public PhotoDTO toDTO(Photo photo) {
+        // 单条路径（详情/上传返回）：分类只查一次，EXIF 明细照常返回
+        Map<Long, String> names = categoryNamesOf(
+                photo.getCategoryId() == null ? List.of() : List.of(photo.getCategoryId()));
+        return toDTO(photo, names, true);
+    }
+
+    /**
+     * 列表页一次性预取分类名（同一个页面的照片通常只落在少数几个分类上）
+     *
+     * 此前 toDTO 逐行 `categoryMapper.selectById`，一页 20 条就是 20 次查询，
+     * 而首页是"拉全量照片"，这个成本随照片数线性增长。
+     */
+    private Map<Long, String> categoryNamesOf(Collection<Long> categoryIds) {
+        Set<Long> ids = categoryIds.stream().filter(Objects::nonNull).collect(Collectors.toSet());
+        if (ids.isEmpty()) {
+            return Map.of();
+        }
+        return categoryMapper.selectBatchIds(ids).stream()
+                .collect(Collectors.toMap(Category::getId, Category::getName, (a, b) -> a));
+    }
+
+    /**
+     * @param categoryNames 调用方批量预取的"分类ID → 名称"；为空表示没有需要填充的分类
+     * @param includeExif   列表接口传 false：exifInfo 是较大的 JSON，只有详情/灯箱需要
+     */
+    private PhotoDTO toDTO(Photo photo, Map<Long, String> categoryNames, boolean includeExif) {
         PhotoDTO dto = new PhotoDTO();
         dto.setId(photo.getId());
         dto.setTitle(photo.getTitle());
@@ -1046,7 +1089,10 @@ public class PhotoServiceImpl extends ServiceImpl<PhotoMapper, Photo> implements
         dto.setIsPrivate(photo.getIsPrivate());
         dto.setViewCount(photo.getViewCount());
         dto.setLikeCount(photo.getLikeCount());
-        dto.setExifInfo(photo.getExifInfo());
+        // exifInfo 是一段较大的 JSON，只有详情/灯箱需要；列表接口不返回
+        if (includeExif) {
+            dto.setExifInfo(photo.getExifInfo());
+        }
         dto.setCameraModel(photo.getCameraModel());
         dto.setAperture(photo.getAperture());
         dto.setShutterSpeed(photo.getShutterSpeed());
@@ -1056,11 +1102,10 @@ public class PhotoServiceImpl extends ServiceImpl<PhotoMapper, Photo> implements
         dto.setGpsLatitude(photo.getGpsLatitude());
         dto.setGpsLongitude(photo.getGpsLongitude());
 
-        // 填充分类名称
         if (photo.getCategoryId() != null) {
-            Category cat = categoryMapper.selectById(photo.getCategoryId());
-            if (cat != null) {
-                dto.setCategoryName(cat.getName());
+            String name = categoryNames.get(photo.getCategoryId());
+            if (name != null) {
+                dto.setCategoryName(name);
             }
         }
         return dto;

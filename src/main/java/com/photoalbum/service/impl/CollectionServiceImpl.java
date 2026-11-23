@@ -38,6 +38,7 @@ import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
 import java.util.stream.Collectors;
 
@@ -100,7 +101,7 @@ public class CollectionServiceImpl implements CollectionService {
                 .orderByDesc(PhotoCollection::getCreatedAt);
 
         List<PhotoCollection> collections = collectionMapper.selectList(wrapper);
-        return collections.stream().map(this::toDTO).collect(Collectors.toList());
+        return toDTOList(collections);
     }
 
     @Override
@@ -148,15 +149,7 @@ public class CollectionServiceImpl implements CollectionService {
         accessPolicy.applyManagedCollectionFilter(wrapper, getCurrentUser());
         wrapper.orderByAsc(PhotoCollection::getSortOrder)
                 .orderByDesc(PhotoCollection::getCreatedAt);
-        return collectionMapper.selectList(wrapper).stream().map(this::toDTO).collect(Collectors.toList());
-    }
-
-    /** 合集内对当前调用者可见的照片数（与照片列表同一判定入口，避免暴露隐藏照片数量） */
-    private int countVisiblePhotos(Long collectionId) {
-        LambdaQueryWrapper<Photo> wrapper = new LambdaQueryWrapper<Photo>()
-                .inSql(Photo::getId, "SELECT photo_id FROM t_collection_photos WHERE collection_id = " + collectionId);
-        accessPolicy.applyPhotoFilter(wrapper, getCurrentUser());
-        return photoMapper.selectCount(wrapper).intValue();
+        return toDTOList(collectionMapper.selectList(wrapper));
     }
 
     @Override
@@ -474,7 +467,56 @@ public class CollectionServiceImpl implements CollectionService {
         return photoMapper.selectOne(wrapper);
     }
 
+    private List<CollectionDTO> toDTOList(List<PhotoCollection> collections) {
+        if (collections == null || collections.isEmpty()) {
+            return List.of();
+        }
+        List<Long> ids = collections.stream().map(PhotoCollection::getId).collect(Collectors.toList());
+        // 照片数一次查完；显式封面一次查完。此前是"每个合集 2~3 次查询"。
+        Map<Long, Long> counts = countVisiblePhotosByCollection(ids);
+        Map<Long, Photo> covers = batchLoadCoverPhotos(collections);
+        return collections.stream()
+                .map(collection -> toDTO(collection, counts.getOrDefault(collection.getId(), 0L), covers))
+                .collect(Collectors.toList());
+    }
+
+    /** 批量统计各合集内"对调用者可见"的照片数（一次 GROUP BY） */
+    private Map<Long, Long> countVisiblePhotosByCollection(List<Long> collectionIds) {
+        List<Map<String, Object>> rows = collectionPhotoMapper.countVisibleByCollections(
+                collectionIds, accessPolicy.visiblePhotoSql(getCurrentUser()));
+        Map<Long, Long> counts = new HashMap<>();
+        if (rows == null) {
+            return counts;
+        }
+        for (Map<String, Object> row : rows) {
+            Object collectionId = row.get("collectionId");
+            Object count = row.get("cnt");
+            if (collectionId instanceof Number id && count instanceof Number value) {
+                counts.put(id.longValue(), value.longValue());
+            }
+        }
+        return counts;
+    }
+
+    /** 一次查出所有显式封面照片（避免逐合集 selectById） */
+    private Map<Long, Photo> batchLoadCoverPhotos(List<PhotoCollection> collections) {
+        List<Long> coverIds = collections.stream()
+                .map(PhotoCollection::getCoverPhotoId)
+                .filter(Objects::nonNull)
+                .distinct()
+                .collect(Collectors.toList());
+        if (coverIds.isEmpty()) {
+            return Map.of();
+        }
+        return photoMapper.selectBatchIds(coverIds).stream()
+                .collect(Collectors.toMap(Photo::getId, photo -> photo, (a, b) -> a));
+    }
+
     private CollectionDTO toDTO(PhotoCollection collection) {
+        return toDTOList(List.of(collection)).get(0);
+    }
+
+    private CollectionDTO toDTO(PhotoCollection collection, long photoCount, Map<Long, Photo> covers) {
         User user = getCurrentUser();
         CollectionDTO dto = new CollectionDTO();
         dto.setId(collection.getId());
@@ -484,12 +526,11 @@ public class CollectionServiceImpl implements CollectionService {
         dto.setIsPublished(collection.getIsPublished());
         dto.setIsPrivate(collection.getIsPrivate());
         // 统计照片数（与封面一样复用同一套可见性判定，避免暴露隐藏照片的数量）
-        dto.setPhotoCount(countVisiblePhotos(collection.getId()));
+        dto.setPhotoCount((int) photoCount);
 
         // 封面：显式封面仅在“该照片对调用者可见”时才对外输出。
         // coverPhotoId 与 coverUrl 一并收敛——否则仅凭 ID 即可确认某张私密照片的存在（修复 S01）
-        Photo cover = collection.getCoverPhotoId() == null
-                ? null : photoMapper.selectById(collection.getCoverPhotoId());
+        Photo cover = collection.getCoverPhotoId() == null ? null : covers.get(collection.getCoverPhotoId());
         boolean coverVisible = cover != null && accessPolicy.canViewPhoto(user, cover);
         dto.setCoverPhotoId(coverVisible ? collection.getCoverPhotoId() : null);
 
