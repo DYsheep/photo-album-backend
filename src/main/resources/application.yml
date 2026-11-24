@@ -96,24 +96,8 @@ app:
     # 允许跨域访问的来源白名单（逗号分隔），不使用通配符
     allowed-origins: https://www.dyframe.art,https://dyframe.art,http://localhost:5173,http://127.0.0.1:5173
   security:
-
-  # 年度海报的 AI 素材（A+C 方案，均可缺席）
-  # A. 背景生成：任何 OpenAI 兼容的图像接口（火山方舟 / 阿里百炼兼容模式 / 硅基流动 / 智谱等）
-  # C. 文案生成：DeepSeek 文本模型
-  ai:
-    image:
-      base-url: ${AI_IMAGE_BASE_URL:}
-      path: ${AI_IMAGE_PATH:/images/generations}
-      api-key: ${AI_IMAGE_API_KEY:}
-      model: ${AI_IMAGE_MODEL:}
-      size: ${AI_IMAGE_SIZE:1024x1536}
-      timeout-ms: ${AI_IMAGE_TIMEOUT_MS:120000}
-    copy:
-      base-url: ${DEEPSEEK_BASE_URL:https://api.deepseek.com}
-      api-key: ${DEEPSEEK_API_KEY:}
-      model: ${DEEPSEEK_MODEL:deepseek-chat}
-      timeout-ms: ${DEEPSEEK_TIMEOUT_MS:30000}
     # 部署在 Nginx 反向代理之后时为 true：登录限流按 X-Forwarded-For 最右侧地址取值
+
     # （最左侧为客户可伪造字段）。服务直接对外暴露时请设为 false。
     # 可用环境变量 TRUST_PROXY=false 覆盖——此前该值写死为 true，直连部署（如只开 8080）
     # 时攻击者每个请求换一个伪造 XFF 即可绕过来源维度限流。
