@@ -1181,6 +1181,12 @@ class PhotoServiceTest {
             assertEquals(4, stats.get("photoCount"));   // 2026 年 4 张（含只有日期的那张）
             assertEquals(3, stats.get("shootingDays")); // 03-14、07-02、08-01
 
+            int[] hours = (int[]) stats.get("hours");
+            assertEquals(1, hours[5]);   // 05:12
+            assertEquals(1, hours[18]);  // 18:40
+            assertEquals(1, hours[23]);  // 23:47
+            assertEquals(0, hours[12]);
+
             @SuppressWarnings("unchecked")
             Map<String, Object> earliest = (Map<String, Object>) stats.get("earliest");
             @SuppressWarnings("unchecked")

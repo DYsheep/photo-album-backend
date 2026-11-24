@@ -694,9 +694,10 @@ public class PhotoServiceImpl extends ServiceImpl<PhotoMapper, Photo> implements
         List<Photo> yearPhotos = byYear.getOrDefault(targetYear, List.of());
         data.put("photoCount", yearPhotos.size());
 
-        // 拍摄天数 + 月度分布
+        // 拍摄天数 + 月度分布 + 小时分布（用于判断"凌晨/白天/夜晚"气质）
         Set<String> days = new HashSet<>();
         int[] months = new int[12];
+        int[] hours = new int[24];
         for (Photo p : yearPhotos) {
             String day = parseTakenDay(p.getDateTaken());
             if (day != null) {
@@ -704,9 +705,15 @@ public class PhotoServiceImpl extends ServiceImpl<PhotoMapper, Photo> implements
                 int month = parseMonth(day);
                 if (month >= 1 && month <= 12) months[month - 1]++;
             }
+            String time = parseTakenTime(p.getDateTaken());
+            if (time != null) {
+                int hour = parseHour(time);
+                if (hour >= 0 && hour < 24) hours[hour]++;
+            }
         }
         data.put("shootingDays", days.size());
         data.put("months", months);
+        data.put("hours", hours);
 
         // 最早 / 最晚拍摄时刻（只统计带时分秒的记录）
         Photo earliest = null;
@@ -778,6 +785,15 @@ public class PhotoServiceImpl extends ServiceImpl<PhotoMapper, Photo> implements
         String[] parts = dateTaken.trim().split("\\s+");
         if (parts.length < 2 || !parts[1].matches("\\d{2}:\\d{2}(:\\d{2})?")) return null;
         return parts[1].substring(0, 5);
+    }
+
+    /** "05:12" → 5 */
+    private int parseHour(String time) {
+        try {
+            return Integer.parseInt(time.substring(0, 2));
+        } catch (Exception e) {
+            return -1;
+        }
     }
 
     private int parseMonth(String day) {
